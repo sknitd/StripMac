@@ -23,9 +23,14 @@ final class Minimap {
         let a = engine.screenArea
         p.setFrameOrigin(NSPoint(x: a.midX - 160, y: a.minY + 24))
         view.update(engine: engine)
-        p.alphaValue = 1
-        p.orderFrontRegardless()
         hide?.cancel()
+        // Setting alphaValue directly can be overridden by an in-flight fade; animating to 1 with
+        // zero duration replaces that animation.
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0
+            p.animator().alphaValue = 1
+        }
+        p.orderFrontRegardless()
         let w = DispatchWorkItem { [weak p] in
             NSAnimationContext.runAnimationGroup({ $0.duration = 0.4; p?.animator().alphaValue = 0 })
         }
@@ -35,15 +40,22 @@ final class Minimap {
 }
 
 final class MinimapView: NSView {
-    private var widths: [CGFloat] = []
+    // Fractions of the panel width: (start, length).
+    private var bars: [(CGFloat, CGFloat)] = []
     private var focus = 0
     private var viewport: (CGFloat, CGFloat) = (0, 1)
 
+    /// Uses the engine's real geometry (gaps, minimum widths), and spans both the strip and the
+    /// viewport, so the viewport stays inside the panel even when it extends past a strip end.
     func update(engine: StripEngine) {
-        let total = max(engine.stripLength, engine.usableWidth, 1)
-        widths = engine.columns.map { CGFloat($0.width) * engine.usableWidth / total }
+        let lo = min(0, engine.scroll)
+        let hi = max(engine.stripLength, engine.scroll + engine.usableWidth)
+        let span = max(hi - lo, 1)
+        bars = engine.columns.indices.map { i in
+            ((engine.stripX(i) - lo) / span, engine.colWidth(engine.columns[i]) / span)
+        }
         focus = engine.focus
-        viewport = (engine.scroll / total, engine.usableWidth / total)
+        viewport = ((engine.scroll - lo) / span, engine.usableWidth / span)
         needsDisplay = true
     }
 
@@ -51,12 +63,11 @@ final class MinimapView: NSView {
         let bg = NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10)
         NSColor.black.withAlphaComponent(0.6).setFill(); bg.fill()
         let inner = bounds.insetBy(dx: 10, dy: 10)
-        var x = inner.minX
-        for (i, w) in widths.enumerated() {
-            let r = NSRect(x: x, y: inner.minY, width: max(2, w * inner.width - 2), height: inner.height)
+        for (i, b) in bars.enumerated() {
+            let r = NSRect(x: inner.minX + b.0 * inner.width, y: inner.minY,
+                           width: max(2, b.1 * inner.width), height: inner.height)
             (i == focus ? NSColor.controlAccentColor : NSColor.white.withAlphaComponent(0.35)).setFill()
             NSBezierPath(roundedRect: r, xRadius: 3, yRadius: 3).fill()
-            x += w * inner.width
         }
         let vp = NSRect(x: inner.minX + viewport.0 * inner.width, y: inner.minY - 3,
                         width: viewport.1 * inner.width, height: inner.height + 6)
