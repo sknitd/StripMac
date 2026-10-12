@@ -196,7 +196,7 @@ final class StripEngine {
 
     private func processGeometryChanges() {
         let pending = geometryPending
-        geometryPending = []
+        geometryPending = [:]
         var changed = false
         var dragged: Set<Win> = []
         for c in columns {
