@@ -47,6 +47,10 @@ final class StripEngine {
     private var refreshWork: DispatchWorkItem?
     private var geometryWork: DispatchWorkItem?
     private var geometryPending: Set<Win> = []
+    private var observers: [NSObjectProtocol] = []
+    /// Window we just asked to focus. App activation is asynchronous, so until it reports focus
+    /// (or the deadline passes) the system's stale focused window must not override ours.
+    private var expectedFocus: (win: Win, until: Date)?
 
     /// The display the strip lives on: the one chosen in Settings, else the primary display.
     /// (Not `NSScreen.main`, which follows keyboard focus from display to display.)
@@ -68,6 +72,14 @@ final class StripEngine {
             self?.tick()
         }
         settings.onChange = { [weak self] in self?.ensureVisible(); self?.layout() }
+        let wnc = NSWorkspace.shared.notificationCenter
+        for name in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didLaunchApplicationNotification,
+                     NSWorkspace.didTerminateApplicationNotification, NSWorkspace.didHideApplicationNotification,
+                     NSWorkspace.didUnhideApplicationNotification, NSWorkspace.activeSpaceDidChangeNotification] {
+            observers.append(wnc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.scheduleRefresh()
+            })
+        }
     }
 
     private func tick() {
@@ -230,12 +242,23 @@ final class StripEngine {
             changed = true
         }
         focus = columns.isEmpty ? 0 : min(max(focus, 0), columns.count - 1)
-        // Track the user's real focus (click / Cmd-Tab) without stealing it.
-        if let fw = AX.focusedWindow(), !isStalled(fw.pid),
-           let i = columns.firstIndex(where: { $0.win == fw }), i != focus {
-            focus = i; ensureVisible(); changed = true
-        }
+        if syncFocusFromSystem() { changed = true }
         return changed
+    }
+
+    /// Tracks the user's real focus (click / ⌘-Tab) without stealing it.
+    private func syncFocusFromSystem() -> Bool {
+        guard let app = NSWorkspace.shared.frontmostApplication, !isStalled(app.processIdentifier),
+              let fw = AX.focusedWindow() else { return false }
+        if let e = expectedFocus {
+            // Wait for the window we focused to report focus before trusting the system again.
+            if e.win != fw && Date() < e.until { return false }
+            expectedFocus = nil
+        }
+        guard let i = columns.firstIndex(where: { $0.win == fw }), i != focus else { return false }
+        focus = i
+        scrollToFocus()
+        return true
     }
 
     // MARK: Putting windows back
@@ -362,10 +385,20 @@ final class StripEngine {
 
     // MARK: Commands
 
-    func focusLeft() { guard focus > 0 else { return }; focus -= 1; columns[focus].win.focus(); scrollToFocus() }
-    func focusRight() { guard focus + 1 < columns.count else { return }; focus += 1; columns[focus].win.focus(); scrollToFocus() }
-    func focusFirst() { guard !columns.isEmpty else { return }; focus = 0; columns[0].win.focus(); scrollToFocus() }
-    func focusLast() { guard !columns.isEmpty else { return }; focus = columns.count - 1; columns[focus].win.focus(); scrollToFocus() }
+    /// Focuses a column on our own initiative (keyboard, gesture).
+    private func focusColumn(_ i: Int) {
+        guard columns.indices.contains(i) else { return }
+        focus = i
+        let w = columns[i].win
+        expectedFocus = (w, Date().addingTimeInterval(0.6))
+        w.focus()
+        scrollToFocus()
+    }
+
+    func focusLeft() { guard focus > 0 else { return }; focusColumn(focus - 1) }
+    func focusRight() { guard focus + 1 < columns.count else { return }; focusColumn(focus + 1) }
+    func focusFirst() { focusColumn(0) }
+    func focusLast() { focusColumn(columns.count - 1) }
 
     func moveLeft() {
         guard focus > 0 else { return }
@@ -418,9 +451,7 @@ final class StripEngine {
             let c = stripX(i) + colWidth(columns[i]) / 2
             if abs(c - mid) < bestD { bestD = abs(c - mid); best = i }
         }
-        focus = best
-        columns[focus].win.focus()
-        scrollToFocus()
+        focusColumn(best)
     }
 
     /// Re-applies every frame, e.g. after a manual re-tile.
