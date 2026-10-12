@@ -19,7 +19,8 @@ final class Gestures {
 
     func start() {
         let t = ScrollTap { [weak self] action in
-            DispatchQueue.main.async { MainActor.assumeIsolated { self?.perform(action) } }
+            guard let self else { return }
+            DispatchQueue.main.async { MainActor.assumeIsolated { self.perform(action) } }
         }
         tap = t
         syncEnabled()
