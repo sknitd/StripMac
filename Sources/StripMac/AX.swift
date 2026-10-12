@@ -1,6 +1,11 @@
 import AppKit
 import ApplicationServices
 
+/// Private but long-stable HIServices call mapping an AX window to its CGWindowID
+/// (used the same way by Rectangle, yabai and AeroSpace).
+@_silgen_name("_AXUIElementGetWindow") @discardableResult
+private func _AXUIElementGetWindow(_ element: AXUIElement, _ id: inout CGWindowID) -> AXError
+
 /// Hashable wrapper around an AXUIElement window reference.
 struct Win: Hashable {
     let el: AXUIElement
@@ -24,6 +29,11 @@ struct Win: Hashable {
     var subrole: String { attr(kAXSubroleAttribute) ?? "" }
     var isMinimized: Bool { (attr(kAXMinimizedAttribute) as Bool?) ?? false }
     var isFullscreen: Bool { (attr("AXFullScreen") as Bool?) ?? false }
+
+    var windowID: CGWindowID? {
+        var id: CGWindowID = 0
+        return _AXUIElementGetWindow(el, &id) == .success && id != 0 ? id : nil
+    }
 
     var isResizable: Bool {
         var settable: DarwinBoolean = false
@@ -104,6 +114,14 @@ enum AX {
         if err == .cannotComplete { return nil }
         guard err == .success, let arr = v as? [AXUIElement] else { return [] }
         return arr.map { Win(el: $0, pid: pid) }
+    }
+
+    /// IDs of windows ordered in on the current Space. Minimised windows, background tabs,
+    /// hidden apps and other Spaces are missing; position on or off the display doesn't matter.
+    static func onScreenWindowIDs() -> Set<CGWindowID>? {
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]], !list.isEmpty else { return nil }
+        return Set(list.compactMap { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value })
     }
 
     static func focusedWindow() -> Win? {

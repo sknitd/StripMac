@@ -51,6 +51,14 @@ final class StripEngine {
     /// Window we just asked to focus. App activation is asynchronous, so until it reports focus
     /// (or the deadline passes) the system's stale focused window must not override ours.
     private var expectedFocus: (win: Win, until: Date)?
+    private var screenWork: DispatchWorkItem?
+
+    /// Windows that left the strip but are still alive (minimised, fullscreen, hidden app,
+    /// other Space, background tab), with enough to put them back where they were.
+    private struct Suspended { let width: Double; let index: Int; let left: Win? }
+    private var suspended: [Win: Suspended] = [:]
+    private var lastSweep = Date()
+    private var windowIDs: [Win: CGWindowID] = [:]
 
     /// The display the strip lives on: the one chosen in Settings, else the primary display.
     /// (Not `NSScreen.main`, which follows keyboard focus from display to display.)
@@ -80,6 +88,29 @@ final class StripEngine {
                 self?.scheduleRefresh()
             })
         }
+        observers.append(NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.screensChanged() })
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
+            observers.append(wnc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.screensChanged()
+            })
+        }
+    }
+
+    /// Displays were added, removed, rearranged or woke up, or the Dock/resolution changed:
+    /// re-lay out everything once things settle.
+    private func screensChanged() {
+        screenWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self, self.enabled else { return }
+            self.invalidateFrames()
+            self.refresh()
+            self.ensureVisible()
+            self.layout()
+        }
+        screenWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: w)
     }
 
     private func tick() {
@@ -159,8 +190,7 @@ final class StripEngine {
             changed = true
         }
         if !dragged.isEmpty {
-            columns.removeAll { dragged.contains($0.win) }
-            focus = columns.isEmpty ? 0 : min(focus, columns.count - 1)
+            _ = removeColumns { dragged.contains($0.win) }
             ensureVisible()
         }
         if changed { layout() }
@@ -188,22 +218,61 @@ final class StripEngine {
 
     // MARK: Window discovery
 
-    private func tileable(_ w: Win, excluded: Bool) -> Bool {
-        if excluded { return false }
+    private enum Kind { case tile, float, away }
+
+    /// tile: belongs on the strip. float: shown but not ours (float-listed app, panel, fixed size).
+    /// away: alive but not shown right now (minimised, fullscreen, other Space, background tab).
+    private func classify(_ w: Win, excluded: Bool, onScreen: Set<CGWindowID>?) -> Kind {
+        if excluded { return .float }
         if !standardWindows.contains(w) {
             // Only cache positives: a window can report an unknown subrole while it is being created.
-            guard w.subrole == (kAXStandardWindowSubrole as String), w.isResizable else { return false }
+            guard w.subrole == (kAXStandardWindowSubrole as String), w.isResizable else { return .float }
             standardWindows.insert(w)
         }
-        return !w.isMinimized && !w.isFullscreen
+        if let onScreen, let id = windowID(w) {
+            if !onScreen.contains(id) { return .away }
+        } else if w.isMinimized {
+            return .away
+        }
+        return w.isFullscreen ? .away : .tile
+    }
+
+    private func windowID(_ w: Win) -> CGWindowID? {
+        if let id = windowIDs[w] { return id }
+        let id = w.windowID
+        windowIDs[w] = id
+        return id
+    }
+
+    /// Removes columns, keeping focus on the same window, or on its nearest neighbour if that
+    /// window went. Returns what was removed with its old index and left neighbour.
+    private func removeColumns(where gone: (Column) -> Bool) -> [(column: Column, index: Int, left: Win?)] {
+        let focusedWin = columns.indices.contains(focus) ? columns[focus].win : nil
+        var kept: [Column] = [], removed: [(column: Column, index: Int, left: Win?)] = []
+        var removedBeforeFocus = 0
+        for (i, c) in columns.enumerated() {
+            if gone(c) {
+                removed.append((column: c, index: i, left: i > 0 ? columns[i - 1].win : nil))
+                if i < focus { removedBeforeFocus += 1 }
+            } else {
+                kept.append(c)
+            }
+        }
+        guard !removed.isEmpty else { return [] }
+        columns = kept
+        if let fw = focusedWin, let i = columns.firstIndex(where: { $0.win == fw }) { focus = i }
+        else { focus -= removedBeforeFocus }
+        focus = columns.isEmpty ? 0 : min(max(focus, 0), columns.count - 1)
+        return removed
     }
 
     /// Syncs columns with live windows. Returns true if anything changed.
     @discardableResult
     func refresh() -> Bool {
         guard stripScreen != nil else { return false }
-        var live: [Win] = []
-        var running = Set<pid_t>(), stalledPIDs = Set<pid_t>(), seen = Set<Win>()
+        let onScreen = AX.onScreenWindowIDs()
+        var live: [Win] = [], floating = Set<Win>(), seen = Set<Win>()
+        var running = Set<pid_t>(), stalledPIDs = Set<pid_t>()
         let excludedIDs = settings.excluded
         for app in NSWorkspace.shared.runningApplications
         where app.activationPolicy == .regular && app.processIdentifier != selfPID {
@@ -218,30 +287,82 @@ final class StripEngine {
             let excluded = app.bundleIdentifier.map { excludedIDs.contains($0) } ?? false
             for w in wins {
                 seen.insert(w)
-                if tileable(w, excluded: excluded) { live.append(w) }
+                switch classify(w, excluded: excluded, onScreen: onScreen) {
+                case .tile: live.append(w)
+                case .float: floating.insert(w)
+                case .away: break
+                }
             }
         }
         standardWindows.formIntersection(seen)
+        windowIDs = windowIDs.filter { seen.contains($0.key) }
         for (pid, w) in watchers where !running.contains(pid) { w.stop(); watchers[pid] = nil }
+        suspended = suspended.filter { running.contains($0.key.pid) }
+        if Date().timeIntervalSince(lastSweep) > 10 {
+            // Windows closed while away (e.g. on another Space) are never reported; drop them.
+            lastSweep = Date()
+            suspended = suspended.filter { stalledPIDs.contains($0.key.pid) || seen.contains($0.key) || $0.key.isAlive }
+        }
 
         let liveSet = Set(live)
-        let before = columns.count
-        // Columns of an app that is not answering stay put until it recovers.
-        let leaving = columns.filter { !liveSet.contains($0.win) && !stalledPIDs.contains($0.win.pid) }
-        columns.removeAll { !liveSet.contains($0.win) && !stalledPIDs.contains($0.win.pid) }
-        // A window that left the strip without closing (floated, minimised and restored, …)
-        // may still be parked off-screen: bring it back.
-        for c in leaving where seen.contains(c.win) || c.win.isAlive { rescueIfOffScreen(c.win) }
-        var changed = columns.count != before
         let known = Set(columns.map { $0.win })
-        for w in live where !known.contains(w) && admits(frame: w.frame) {
-            // New windows open right beside the focused column.
-            let idx = columns.isEmpty ? 0 : min(focus + 1, columns.count)
-            columns.insert(Column(win: w, width: settings.defaultWidth), at: idx)
+        var newcomers = live.filter { !known.contains($0) }
+        var frames: [Win: CGRect] = [:]
+        for w in newcomers { frames[w] = w.frame }
+        var changed = false
+
+        // Switching native tabs swaps which window of the group is shown. The newly shown tab
+        // (same app, same frame) takes over its sibling's column instead of getting its own.
+        for c in columns where !liveSet.contains(c.win) && seen.contains(c.win) && !floating.contains(c.win) {
+            guard let old = c.applied ?? c.win.frame,
+                  let j = newcomers.firstIndex(where: { n in
+                      n.pid == c.win.pid && frames[n].map { f in Self.approxEqual(f, old) } == true
+                  }),
+                  !c.win.isMinimized else { continue }
+            c.win = newcomers.remove(at: j)
+            c.applied = nil
+            watchers[c.win.pid]?.watchDestroyed(c.win)
+            changed = true
+        }
+
+        // Columns of an app that is not answering stay put until it recovers.
+        let removed = removeColumns { !liveSet.contains($0.win) && !stalledPIDs.contains($0.win.pid) }
+        for r in removed {
+            changed = true
+            let w = r.column.win
+            if floating.contains(w) {
+                // Left the strip for good (e.g. its app was added to the float list) and may
+                // still be parked off-screen: bring it back.
+                rescueIfOffScreen(w)
+            } else if seen.contains(w) || w.isAlive {
+                suspended[w] = Suspended(width: r.column.width, index: r.index, left: r.left)
+            }
+        }
+
+        // Returning windows go back to their old slot, at their old width.
+        let returning = newcomers.compactMap { w in suspended[w].map { (w, $0) } }
+            .sorted { $0.1.index < $1.1.index }
+        let focusedWin = columns.indices.contains(focus) ? columns[focus].win : nil
+        for (w, s) in returning {
+            suspended[w] = nil
+            let afterLeft = s.left.flatMap { l in columns.firstIndex { $0.win == l } }.map { $0 + 1 }
+            columns.insert(Column(win: w, width: s.width), at: afterLeft ?? min(s.index, columns.count))
             watchers[w.pid]?.watchDestroyed(w)
             changed = true
         }
+        let back = Set(returning.map { $0.0 })
+
+        // New windows open right beside the focused column, in the order they were found.
+        var insertAt = focusedWin.flatMap { fw in columns.firstIndex { $0.win == fw } }.map { $0 + 1 } ?? columns.count
+        for w in newcomers where !back.contains(w) && admits(frame: frames[w]) {
+            columns.insert(Column(win: w, width: settings.defaultWidth), at: insertAt)
+            insertAt += 1
+            watchers[w.pid]?.watchDestroyed(w)
+            changed = true
+        }
+        if let fw = focusedWin, let i = columns.firstIndex(where: { $0.win == fw }) { focus = i }
         focus = columns.isEmpty ? 0 : min(max(focus, 0), columns.count - 1)
+        if changed { clampScroll() }
         if syncFocusFromSystem() { changed = true }
         return changed
     }
@@ -271,6 +392,8 @@ final class StripEngine {
             clampOnScreen(c.win)
             c.applied = nil
         }
+        // Away windows (other Space, minimised, …) may have been parked too.
+        for w in suspended.keys where !isStalled(w.pid) { clampOnScreen(w) }
     }
 
     /// Clamps a window into the visible area of the strip's display.
@@ -334,6 +457,8 @@ final class StripEngine {
     func layout() {
         guard enabled, let scr = stripScreen else { return }
         let a = scr.visibleFrame, disp = scr.frame
+        // During display sleep or reconfiguration the frame can be empty: write nothing.
+        guard a.width >= 300, a.height >= 200 else { return }
         let all = NSScreen.screens.reduce(CGRect.null) { $0.union($1.frame) }
         var x = a.minX + gap - scroll
         for c in columns {
