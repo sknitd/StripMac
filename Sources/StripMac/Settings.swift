@@ -23,6 +23,8 @@ final class Settings: ObservableObject {
     @Published var gesturesEnabled: Bool { didSet { d.set(gesturesEnabled, forKey: "gestures") } }
     @Published var showMinimap: Bool { didSet { d.set(showMinimap, forKey: "minimap") } }
     @Published var excludedBundleIDs: String { didSet { d.set(excludedBundleIDs, forKey: "excluded"); changed() } }
+    /// CGDirectDisplayID of the strip's display; 0 = the primary display.
+    @Published var stripDisplayID: Int { didSet { d.set(stripDisplayID, forKey: "stripDisplay"); changed() } }
 
     var onChange: (() -> Void)?
 
@@ -34,6 +36,7 @@ final class Settings: ObservableObject {
         gesturesEnabled = d.object(forKey: "gestures") as? Bool ?? true
         showMinimap = d.object(forKey: "minimap") as? Bool ?? true
         excludedBundleIDs = d.string(forKey: "excluded") ?? "com.apple.calculator, com.apple.systempreferences"
+        stripDisplayID = d.integer(forKey: "stripDisplay")
     }
 
     var presets: [Double] {

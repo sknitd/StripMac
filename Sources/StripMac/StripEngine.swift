@@ -1,5 +1,10 @@
 import AppKit
 
+extension NSScreen {
+    /// The CGDirectDisplayID, stable across reconfigurations (unlike the index in `screens`).
+    var displayID: Int { (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.intValue ?? 0 }
+}
+
 final class Column {
     var win: Win
     var width: Double   // fraction of usable screen width
@@ -17,7 +22,7 @@ private func axObserverCallback(_ observer: AXObserver, _ element: AXUIElement,
     engine.handleAXNotification(name, element: element)
 }
 
-/// One infinite horizontal strip of full-height columns on the main display.
+/// One infinite horizontal strip of full-height columns, pinned to one display.
 final class StripEngine {
     private(set) var columns: [Column] = []
     private(set) var focus = 0
@@ -43,7 +48,15 @@ final class StripEngine {
     private var geometryWork: DispatchWorkItem?
     private var geometryPending: Set<Win> = []
 
-    var screenArea: CGRect { NSScreen.main?.visibleFrame ?? .zero }   // Cocoa coords, Dock-aware
+    /// The display the strip lives on: the one chosen in Settings, else the primary display.
+    /// (Not `NSScreen.main`, which follows keyboard focus from display to display.)
+    var stripScreen: NSScreen? {
+        let screens = NSScreen.screens, id = settings.stripDisplayID
+        if id != 0, let s = screens.first(where: { $0.displayID == id }) { return s }
+        return screens.first
+    }
+
+    var screenArea: CGRect { stripScreen?.visibleFrame ?? .zero }   // Cocoa coords, Dock-aware
     var gap: CGFloat { CGFloat(settings.gap) }
     var usableWidth: CGFloat { max(200, screenArea.width - 2 * gap) }
 
@@ -54,7 +67,7 @@ final class StripEngine {
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.tick()
         }
-        settings.onChange = { [weak self] in self?.layout() }
+        settings.onChange = { [weak self] in self?.ensureVisible(); self?.layout() }
     }
 
     private func tick() {
@@ -124,11 +137,19 @@ final class StripEngine {
         let pending = geometryPending
         geometryPending = []
         var changed = false
+        var dragged: Set<Win> = []
         for c in columns where pending.contains(c.win) {
             guard let f = c.win.frame else { continue }
             if let last = c.applied, Self.approxEqual(f, last) { continue }
+            // Dragged onto another display: it leaves the strip and floats there.
+            if let id = displayID(containing: f), id != stripScreen?.displayID { dragged.insert(c.win) }
             c.applied = nil
             changed = true
+        }
+        if !dragged.isEmpty {
+            columns.removeAll { dragged.contains($0.win) }
+            focus = columns.isEmpty ? 0 : min(focus, columns.count - 1)
+            ensureVisible()
         }
         if changed { layout() }
     }
@@ -138,6 +159,20 @@ final class StripEngine {
     }
 
     private func invalidateFrames() { for c in columns { c.applied = nil } }
+
+    /// The display under the centre of an AX-coordinate frame, if any.
+    private func displayID(containing f: CGRect) -> Int? {
+        let centre = AX.flip(CGPoint(x: f.midX, y: f.midY))
+        return NSScreen.screens.first(where: { $0.frame.contains(centre) })?.displayID
+    }
+
+    /// New windows join the strip only if they open on its display, or nowhere visible at all
+    /// (e.g. left parked by an earlier session).
+    private func admits(frame f: CGRect?) -> Bool {
+        guard let f else { return true }
+        guard let id = displayID(containing: f) else { return true }
+        return id == stripScreen?.displayID
+    }
 
     // MARK: Window discovery
 
@@ -154,6 +189,7 @@ final class StripEngine {
     /// Syncs columns with live windows. Returns true if anything changed.
     @discardableResult
     func refresh() -> Bool {
+        guard stripScreen != nil else { return false }
         var live: [Win] = []
         var running = Set<pid_t>(), stalledPIDs = Set<pid_t>(), seen = Set<Win>()
         let excludedIDs = settings.excluded
@@ -186,7 +222,7 @@ final class StripEngine {
         for c in leaving where seen.contains(c.win) || c.win.isAlive { rescueIfOffScreen(c.win) }
         var changed = columns.count != before
         let known = Set(columns.map { $0.win })
-        for w in live where !known.contains(w) {
+        for w in live where !known.contains(w) && admits(frame: w.frame) {
             // New windows open right beside the focused column.
             let idx = columns.isEmpty ? 0 : min(focus + 1, columns.count)
             columns.insert(Column(win: w, width: settings.defaultWidth), at: idx)
@@ -216,7 +252,7 @@ final class StripEngine {
 
     /// Clamps a window into the visible area of the strip's display.
     private func clampOnScreen(_ w: Win, frame: CGRect? = nil) {
-        guard let scr = NSScreen.main, w.isAlive, !w.isFullscreen, var r = frame ?? w.frame else { return }
+        guard let scr = stripScreen, w.isAlive, !w.isFullscreen, var r = frame ?? w.frame else { return }
         let vis = AX.toAX(scr.visibleFrame)
         guard vis.width > 0, vis.height > 0 else { return }
         let orig = r
@@ -270,15 +306,19 @@ final class StripEngine {
         scroll = min(max(scroll, 0), maxS)
     }
 
-    /// Applies frames. Off-screen columns are parked beyond the screen edges.
+    /// Applies frames. Columns that don't reach the strip's display are parked beyond the
+    /// outer edge of *all* displays, so they never show up on a neighbouring one.
     func layout() {
-        guard enabled else { return }
-        let a = screenArea
+        guard enabled, let scr = stripScreen else { return }
+        let a = scr.visibleFrame, disp = scr.frame
+        let all = NSScreen.screens.reduce(CGRect.null) { $0.union($1.frame) }
         var x = a.minX + gap - scroll
         for c in columns {
             let w = colWidth(c)
-            let r = CGRect(x: x, y: a.minY + gap, width: w, height: a.height - 2 * gap)
+            var r = CGRect(x: x, y: a.minY + gap, width: w, height: a.height - 2 * gap)
             x += w + gap
+            if r.maxX <= disp.minX { r.origin.x = all.minX - w - 100 }
+            else if r.minX >= disp.maxX { r.origin.x = all.maxX + 100 }
             apply(AX.toAX(r).integral, to: c)
         }
         onLayout?()

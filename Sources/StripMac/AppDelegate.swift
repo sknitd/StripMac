@@ -176,6 +176,10 @@ struct SettingsView: View {
                 Slider(value: $s.gap, in: 0...40, step: 1) { Text("Gap: \(Int(s.gap)) pt") }
                 Slider(value: $s.defaultWidth, in: 0.2...1.0, step: 0.05) { Text("New window width: \(Int(s.defaultWidth * 100))%") }
                 TextField("Preset widths (fractions)", text: $s.presetsText)
+                Picker("Strip display", selection: $s.stripDisplayID) {
+                    Text("Primary display").tag(0)
+                    ForEach(NSScreen.screens, id: \.displayID) { Text($0.localizedName).tag($0.displayID) }
+                }
                 Picker("Centre focused column", selection: $s.centerMode) {
                     ForEach(CenterMode.allCases) { Text($0.label).tag($0) }
                 }
