@@ -63,10 +63,20 @@ struct Win: Hashable {
         return AXUIElementSetAttributeValue(el, kAXPositionAttribute as CFString, pv)
     }
 
-    func focus() {
+    /// Raises the window and gives its app keyboard focus. Under macOS 14 cooperative activation,
+    /// `NSRunningApplication.activate()` from a background app is often refused, so the app is
+    /// made frontmost through Accessibility, with `activate()` only as a fallback.
+    @discardableResult
+    func focus() -> Bool {
+        let app = AXUIElementCreateApplication(pid)
         AXUIElementSetAttributeValue(el, kAXMainAttribute as CFString, kCFBooleanTrue)
-        AXUIElementPerformAction(el, kAXRaiseAction as CFString)
-        NSRunningApplication(processIdentifier: pid)?.activate()
+        let raised = AXUIElementPerformAction(el, kAXRaiseAction as CFString)
+        let front = AXUIElementSetAttributeValue(app, kAXFrontmostAttribute as CFString, kCFBooleanTrue)
+        let focused = AXUIElementSetAttributeValue(app, kAXFocusedWindowAttribute as CFString, el)
+        if front != .success {
+            NSRunningApplication(processIdentifier: pid)?.activate()
+        }
+        return raised == .success && (front == .success || focused == .success)
     }
 }
 
