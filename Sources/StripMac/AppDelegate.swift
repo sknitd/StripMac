@@ -92,6 +92,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func toggle() {
         engine.enabled.toggle()
         toggleItem.title = engine.enabled ? "Stop Tiling" : "Start Tiling"
+        gestures?.syncEnabled()
     }
 
     @objc func retile() { engine.retile() }
