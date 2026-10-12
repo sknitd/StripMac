@@ -17,15 +17,16 @@ private func crashSignalHandler(_ sig: Int32) {
     raise(sig)
 }
 
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
-    let engine = StripEngine()
+    private(set) lazy var engine = StripEngine()
     private var status: NSStatusItem!
     private var gestures: Gestures?
     private var settingsWindow: NSWindow?
     private var onboardingWindow: NSWindow?
     private var trustTimer: Timer?
     private var toggleItem: NSMenuItem!
-    let minimap = Minimap()
+    private lazy var minimap = Minimap()
 
     private var signalSources: [DispatchSourceSignal] = []
 
@@ -134,7 +135,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard !started else { return }
         trustTimer?.invalidate()
         trustTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] t in
-            if AX.trusted { t.invalidate(); self?.startEngine() }
+            MainActor.assumeIsolated {
+                if AX.trusted { t.invalidate(); self?.startEngine() }
+            }
         }
     }
 
@@ -142,11 +145,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func windowWillClose(_ n: Notification) {
         guard let w = n.object as? NSWindow, w === onboardingWindow else { return }
         DispatchQueue.main.async { [weak self] in
-            if self?.onboardingWindow === w { self?.onboardingWindow = nil }
+            MainActor.assumeIsolated {
+                if self?.onboardingWindow === w { self?.onboardingWindow = nil }
+            }
         }
     }
 }
 
+@MainActor
 struct OnboardingView: View {
     @State private var trusted = AX.trusted
     let timer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
@@ -183,6 +189,7 @@ struct OnboardingView: View {
     }
 }
 
+@MainActor
 struct SettingsView: View {
     @ObservedObject var s: Settings
     @ObservedObject var hotkeys: Hotkeys

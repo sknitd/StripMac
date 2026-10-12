@@ -7,6 +7,7 @@ import Combine
 /// Events come from a CGEventTap so the ones used for navigation can be swallowed: the app under
 /// the cursor never sees them. The tap runs on its own thread, so a busy main thread never
 /// delays scrolling system-wide; actions are handed to the main thread.
+@MainActor
 final class Gestures {
     private let engine: StripEngine
     private var tap: ScrollTap?
@@ -18,7 +19,7 @@ final class Gestures {
 
     func start() {
         let t = ScrollTap { [weak self] action in
-            DispatchQueue.main.async { self?.perform(action) }
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.perform(action) } }
         }
         tap = t
         syncEnabled()
@@ -49,24 +50,23 @@ final class Gestures {
         case .snapWhenIdle:
             // Precise deltas without gesture phases (some mice): snap once they stop.
             snapWork?.cancel()
-            let w = DispatchWorkItem { [weak self] in self?.engine.snapToNearest() }
-            snapWork = w
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: w)
+            snapWork = runOnMain(after: 0.15) { [weak self] in self?.engine.snapToNearest() }
         case .step(let dir):
             if dir < 0 { engine.focusLeft() } else { engine.focusRight() }
         }
     }
 }
 
-/// Owns the event tap and the per-gesture state. Everything except `enabled` is only touched on
-/// the tap's thread (or on the main thread when the global-monitor fallback is used instead).
-final class ScrollTap {
+/// Owns the event tap and the per-gesture state. Everything except `enabled` (lock-protected) is
+/// only touched on the tap's thread (or on the main thread when the global-monitor fallback is
+/// used instead), hence the unchecked Sendable.
+final class ScrollTap: @unchecked Sendable {
     enum Action { case scroll(CGFloat), snap, snapWhenIdle, step(Int) }
 
     private enum State { case idle, tracking, momentum }
     private var state = State.idle
     private var port: CFMachPort?
-    private let send: (Action) -> Void
+    private let send: @Sendable (Action) -> Void
 
     private let lock = NSLock()
     private var _enabled = false
@@ -79,7 +79,7 @@ final class ScrollTap {
     private static let phaseBegan: Int64 = 1, phaseEnded: Int64 = 4, phaseCancelled: Int64 = 8
     private static let momentumEnd: Int64 = 3
 
-    init(send: @escaping (Action) -> Void) { self.send = send }
+    init(send: @escaping @Sendable (Action) -> Void) { self.send = send }
 
     /// Creates the tap on a dedicated thread. Returns false if the tap could not be created.
     func start() -> Bool {

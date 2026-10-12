@@ -5,6 +5,14 @@ extension NSScreen {
     var displayID: Int { (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.intValue ?? 0 }
 }
 
+/// Runs `body` on the main actor after `delay`; cancel the returned item to drop it.
+@MainActor @discardableResult
+func runOnMain(after delay: TimeInterval, _ body: @escaping @MainActor () -> Void) -> DispatchWorkItem {
+    let w = DispatchWorkItem { MainActor.assumeIsolated(body) }
+    DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: w)
+    return w
+}
+
 final class Column {
     var win: Win
     var width: Double   // fraction of usable screen width
@@ -20,10 +28,12 @@ private func axObserverCallback(_ observer: AXObserver, _ element: AXUIElement,
     guard let refcon else { return }
     let engine = Unmanaged<StripEngine>.fromOpaque(refcon).takeUnretainedValue()
     let name = notification as String
-    engine.handleAXNotification(name, element: element)
+    // Observer sources are added to the main run loop, so this runs on the main thread.
+    MainActor.assumeIsolated { engine.handleAXNotification(name, element: element) }
 }
 
 /// One infinite horizontal strip of full-height columns, pinned to one display.
+@MainActor
 final class StripEngine {
     private(set) var columns: [Column] = []
     private(set) var focus = 0
@@ -35,9 +45,9 @@ final class StripEngine {
             else { anim?.invalidate(); releaseWindows() }
         }
     }
-    var onLayout: (() -> Void)?
+    var onLayout: (@MainActor () -> Void)?
     /// Called with false when Accessibility access is revoked, and true when it is back.
-    var onAccessChanged: ((Bool) -> Void)?
+    var onAccessChanged: (@MainActor (Bool) -> Void)?
     private(set) var accessLost = false
 
     private var timer: Timer?
@@ -81,7 +91,9 @@ final class StripEngine {
         refresh(); layout()
         // Safety-net poll; AXObserver notifications handle most changes as they happen.
         // Common run-loop modes keep it running while a menu is open or a slider is dragged.
-        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.tick() }
+        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
+        }
         RunLoop.main.add(t, forMode: .common)
         timer = t
         settings.onChange = { [weak self] in self?.ensureVisible(); self?.layout() }
@@ -90,15 +102,15 @@ final class StripEngine {
                      NSWorkspace.didTerminateApplicationNotification, NSWorkspace.didHideApplicationNotification,
                      NSWorkspace.didUnhideApplicationNotification, NSWorkspace.activeSpaceDidChangeNotification] {
             observers.append(wnc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                self?.scheduleRefresh()
+                MainActor.assumeIsolated { self?.scheduleRefresh() }
             })
         }
         observers.append(NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.screensChanged() })
+        ) { [weak self] _ in MainActor.assumeIsolated { self?.screensChanged() } })
         for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification] {
             observers.append(wnc.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                self?.screensChanged()
+                MainActor.assumeIsolated { self?.screensChanged() }
             })
         }
     }
@@ -107,15 +119,13 @@ final class StripEngine {
     /// re-lay out everything once things settle.
     private func screensChanged() {
         screenWork?.cancel()
-        let w = DispatchWorkItem { [weak self] in
+        screenWork = runOnMain(after: 0.5) { [weak self] in
             guard let self, self.enabled, !self.accessLost else { return }
             self.invalidateFrames()
             self.refresh()
             self.ensureVisible()
             self.layout()
         }
-        screenWork = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: w)
     }
 
     private func tick() {
@@ -173,12 +183,10 @@ final class StripEngine {
     /// Coalesces bursts of window events into one refresh.
     func scheduleRefresh() {
         refreshWork?.cancel()
-        let w = DispatchWorkItem { [weak self] in
+        refreshWork = runOnMain(after: 0.08) { [weak self] in
             guard let self, self.enabled, !self.accessLost else { return }
             if self.refresh() { self.layout() }
         }
-        refreshWork = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: w)
     }
 
     /// A column window moved or resized. Our own writes echo back here, so ignore anything
@@ -189,9 +197,7 @@ final class StripEngine {
         if let t = c.wroteAt, Date().timeIntervalSince(t) < 0.4 { return }
         geometryPending[c.win] = (geometryPending[c.win] ?? false) || resized
         geometryWork?.cancel()
-        let w = DispatchWorkItem { [weak self] in self?.processGeometryChanges() }
-        geometryWork = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: w)
+        geometryWork = runOnMain(after: 0.35) { [weak self] in self?.processGeometryChanges() }
     }
 
     private func processGeometryChanges() {
@@ -523,16 +529,16 @@ final class StripEngine {
     /// Short eased scroll animation toward the target scroll value.
     private func animate(to target: CGFloat) {
         anim?.invalidate()
-        let from = scroll, steps = 8
-        var n = 0
+        let from = scroll, start = Date(), duration = 0.14
         let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
-            guard let self else { timer.invalidate(); return }
-            n += 1
-            let p = CGFloat(n) / CGFloat(steps)
-            let e = 1 - pow(1 - p, 3)
-            self.scroll = from + (target - from) * e
-            self.layout()
-            if n >= steps { timer.invalidate() }
+            MainActor.assumeIsolated {
+                guard let self else { timer.invalidate(); return }
+                let p = min(1, CGFloat(Date().timeIntervalSince(start) / duration))
+                let e = 1 - pow(1 - p, 3)
+                self.scroll = from + (target - from) * e
+                self.layout()
+                if p >= 1 { timer.invalidate() }
+            }
         }
         RunLoop.main.add(t, forMode: .common)
         anim = t

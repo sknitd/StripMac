@@ -12,6 +12,7 @@ enum CenterMode: String, CaseIterable, Identifiable {
     }
 }
 
+@MainActor
 final class Settings: ObservableObject {
     static let shared = Settings()
     private let d = UserDefaults.standard
@@ -26,7 +27,7 @@ final class Settings: ObservableObject {
     /// CGDirectDisplayID of the strip's display; 0 = the primary display.
     @Published var stripDisplayID: Int { didSet { d.set(stripDisplayID, forKey: "stripDisplay"); changed() } }
 
-    var onChange: (() -> Void)?
+    var onChange: (@MainActor () -> Void)?
 
     private init() {
         gap = d.object(forKey: "gap") as? Double ?? 10

@@ -1,6 +1,7 @@
 import AppKit
 
 /// A small overlay showing the whole strip and the visible viewport; fades out after navigating.
+@MainActor
 final class Minimap {
     private var panel: NSPanel?
     private let view = MinimapView()
@@ -31,11 +32,9 @@ final class Minimap {
             p.animator().alphaValue = 1
         }
         p.orderFrontRegardless()
-        let w = DispatchWorkItem { [weak p] in
+        hide = runOnMain(after: 1.2) { [weak p] in
             NSAnimationContext.runAnimationGroup({ $0.duration = 0.4; p?.animator().alphaValue = 0 })
         }
-        hide = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: w)
     }
 }
 

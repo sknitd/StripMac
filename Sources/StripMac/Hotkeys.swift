@@ -2,16 +2,17 @@ import AppKit
 import Carbon.HIToolbox
 
 /// Global hotkeys via Carbon RegisterEventHotKey (no Input Monitoring permission needed).
+@MainActor
 final class Hotkeys: ObservableObject {
     static let shared = Hotkeys()
     /// Names of bindings that could not be registered (usually taken by another app).
     @Published private(set) var failed: Set<String> = []
-    private var actions: [UInt32: () -> Void] = [:]
+    private var actions: [UInt32: @MainActor () -> Void] = [:]
     private var refs: [EventHotKeyRef] = []
     private var nextID: UInt32 = 1
     private var installed = false
 
-    struct Binding { let key: Int; let mods: Int; let name: String; let action: () -> Void }
+    struct Binding { let key: Int; let mods: Int; let name: String; let action: @MainActor () -> Void }
 
     func install() {
         guard !installed else { return }
@@ -21,13 +22,14 @@ final class Hotkeys: ObservableObject {
             var hk = EventHotKeyID()
             let st = GetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
                                        nil, MemoryLayout<EventHotKeyID>.size, nil, &hk)
-            if st == noErr { Hotkeys.shared.fire(hk.id) }
+            // Carbon delivers application-target events on the main thread.
+            if st == noErr { let id = hk.id; MainActor.assumeIsolated { Hotkeys.shared.fire(id) } }
             return noErr
         }, 1, &spec, nil, nil)
     }
 
     fileprivate func fire(_ id: UInt32) {
-        if let a = actions[id] { DispatchQueue.main.async { a() } }
+        if let a = actions[id] { DispatchQueue.main.async { MainActor.assumeIsolated { a() } } }
     }
 
     func register(_ b: Binding) {
@@ -51,13 +53,14 @@ final class Hotkeys: ObservableObject {
     }
 }
 
+@MainActor
 enum DefaultBindings {
     static let ctrlOpt = controlKey | optionKey
     static let ctrlOptShift = controlKey | optionKey | shiftKey
 
-    static func all(engine e: StripEngine, toggle: @escaping () -> Void) -> [Hotkeys.Binding] {
+    static func all(engine e: StripEngine, toggle: @escaping @MainActor () -> Void) -> [Hotkeys.Binding] {
         // Strip commands do nothing while tiling is stopped; only start/stop always works.
-        func cmd(_ f: @escaping () -> Void) -> () -> Void { { if e.enabled { f() } } }
+        func cmd(_ f: @escaping @MainActor () -> Void) -> @MainActor () -> Void { { if e.enabled { f() } } }
         return [
             .init(key: kVK_LeftArrow, mods: ctrlOpt, name: "Focus left  ⌃⌥←", action: cmd(e.focusLeft)),
             .init(key: kVK_ANSI_H, mods: ctrlOpt, name: "Focus left  ⌃⌥H", action: cmd(e.focusLeft)),
