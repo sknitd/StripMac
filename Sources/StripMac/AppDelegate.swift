@@ -54,7 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toggleItem.title = engine.enabled ? "Stop Tiling" : "Start Tiling"
     }
 
-    @objc func retile() { engine.refresh(); engine.ensureVisible(); engine.layout() }
+    @objc func retile() { engine.retile() }
 
     @objc func showSettings() {
         if settingsWindow == nil {

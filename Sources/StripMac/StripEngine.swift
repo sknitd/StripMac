@@ -3,7 +3,18 @@ import AppKit
 final class Column {
     var win: Win
     var width: Double   // fraction of usable screen width
+    var applied: CGRect?     // last frame written to the window (AX coords); nil = unknown
+    var wroteAt: Date?       // when we last wrote it, to tell our own moves from the user's
     init(win: Win, width: Double) { self.win = win; self.width = width }
+}
+
+/// Receives AXObserver notifications on the main run loop and forwards them to the engine.
+private func axObserverCallback(_ observer: AXObserver, _ element: AXUIElement,
+                                _ notification: CFString, _ refcon: UnsafeMutableRawPointer?) {
+    guard let refcon else { return }
+    let engine = Unmanaged<StripEngine>.fromOpaque(refcon).takeUnretainedValue()
+    let name = notification as String
+    engine.handleAXNotification(name, element: element)
 }
 
 /// One infinite horizontal strip of full-height columns on the main display.
@@ -11,7 +22,7 @@ final class StripEngine {
     private(set) var columns: [Column] = []
     private(set) var focus = 0
     private(set) var scroll: CGFloat = 0     // strip x-offset in points
-    var enabled = true { didSet { if enabled { refresh(); layout() } } }
+    var enabled = true { didSet { if enabled { invalidateFrames(); refresh(); layout() } } }
     var onLayout: (() -> Void)?
 
     private var timer: Timer?
@@ -19,48 +30,163 @@ final class StripEngine {
     private let settings = Settings.shared
     private let selfPID = ProcessInfo.processInfo.processIdentifier
 
+    private var watchers: [pid_t: AppWatcher] = [:]
+    private var stalled: [pid_t: Date] = [:]          // apps that timed out, skipped until the date
+    private var standardWindows: Set<Win> = []        // cache: standard subrole and resizable
+    private var refreshWork: DispatchWorkItem?
+    private var geometryWork: DispatchWorkItem?
+    private var geometryPending: Set<Win> = []
+
     var screenArea: CGRect { NSScreen.main?.visibleFrame ?? .zero }   // Cocoa coords, Dock-aware
     var gap: CGFloat { CGFloat(settings.gap) }
     var usableWidth: CGFloat { max(200, screenArea.width - 2 * gap) }
 
     func start() {
+        AX.configureTimeout()
         refresh(); layout()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: true) { [weak self] _ in
-            guard let self, self.enabled else { return }
-            if self.refresh() { self.layout() }
+        // Safety-net poll; AXObserver notifications handle most changes as they happen.
+        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.tick()
         }
         settings.onChange = { [weak self] in self?.layout() }
     }
 
+    private func tick() {
+        guard enabled else { return }
+        let stallEnded = expireStalls()
+        if refresh() || stallEnded { layout() }
+    }
+
+    // MARK: Unresponsive apps
+
+    private func isStalled(_ pid: pid_t) -> Bool { stalled[pid].map { $0 > Date() } ?? false }
+
+    private func markStalled(_ pid: pid_t) { stalled[pid] = Date().addingTimeInterval(3) }
+
+    /// Forgets stalls that have run out. Returns true if any did, so their windows get laid out again.
+    private func expireStalls() -> Bool {
+        let now = Date(), before = stalled.count
+        stalled = stalled.filter { $0.value > now }
+        return stalled.count != before
+    }
+
+    // MARK: AX notifications
+
+    private var refcon: UnsafeMutableRawPointer { Unmanaged.passUnretained(self).toOpaque() }
+
+    private func watcher(for pid: pid_t) -> AppWatcher {
+        if let w = watchers[pid] { return w }
+        let w = AppWatcher(pid: pid, callback: axObserverCallback, refcon: refcon)
+        watchers[pid] = w
+        return w
+    }
+
+    fileprivate func handleAXNotification(_ name: String, element: AXUIElement) {
+        guard enabled else { return }
+        switch name {
+        case kAXWindowMovedNotification, kAXWindowResizedNotification:
+            geometryChanged(element)
+        default:
+            scheduleRefresh()
+        }
+    }
+
+    /// Coalesces bursts of window events into one refresh.
+    func scheduleRefresh() {
+        refreshWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in
+            guard let self, self.enabled else { return }
+            if self.refresh() { self.layout() }
+        }
+        refreshWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: w)
+    }
+
+    /// A column window moved or resized. Our own writes echo back here, so ignore anything
+    /// right after a write; otherwise forget the cached frame so the next layout puts it back.
+    private func geometryChanged(_ el: AXUIElement) {
+        guard let c = columns.first(where: { CFEqual($0.win.el, el) }) else { return }
+        if let t = c.wroteAt, Date().timeIntervalSince(t) < 0.4 { return }
+        geometryPending.insert(c.win)
+        geometryWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in self?.processGeometryChanges() }
+        geometryWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: w)
+    }
+
+    private func processGeometryChanges() {
+        let pending = geometryPending
+        geometryPending = []
+        var changed = false
+        for c in columns where pending.contains(c.win) {
+            guard let f = c.win.frame else { continue }
+            if let last = c.applied, Self.approxEqual(f, last) { continue }
+            c.applied = nil
+            changed = true
+        }
+        if changed { layout() }
+    }
+
+    static func approxEqual(_ a: CGRect, _ b: CGRect, tolerance t: CGFloat = 2) -> Bool {
+        abs(a.minX - b.minX) < t && abs(a.minY - b.minY) < t && abs(a.width - b.width) < t && abs(a.height - b.height) < t
+    }
+
+    private func invalidateFrames() { for c in columns { c.applied = nil } }
+
     // MARK: Window discovery
 
-    private func tileable(_ w: Win, bundle: String?) -> Bool {
-        if let b = bundle, settings.excluded.contains(b) { return false }
-        return w.subrole == (kAXStandardWindowSubrole as String) && !w.isMinimized && !w.isFullscreen && w.isResizable
+    private func tileable(_ w: Win, excluded: Bool) -> Bool {
+        if excluded { return false }
+        if !standardWindows.contains(w) {
+            // Only cache positives: a window can report an unknown subrole while it is being created.
+            guard w.subrole == (kAXStandardWindowSubrole as String), w.isResizable else { return false }
+            standardWindows.insert(w)
+        }
+        return !w.isMinimized && !w.isFullscreen
     }
 
     /// Syncs columns with live windows. Returns true if anything changed.
     @discardableResult
     func refresh() -> Bool {
         var live: [Win] = []
+        var running = Set<pid_t>(), stalledPIDs = Set<pid_t>(), seen = Set<Win>()
+        let excludedIDs = settings.excluded
         for app in NSWorkspace.shared.runningApplications
-        where app.activationPolicy == .regular && app.processIdentifier != selfPID && !app.isHidden {
-            for w in AX.windows(of: app) where tileable(w, bundle: app.bundleIdentifier) { live.append(w) }
+        where app.activationPolicy == .regular && app.processIdentifier != selfPID {
+            let pid = app.processIdentifier
+            running.insert(pid)
+            let watcher = watcher(for: pid)
+            if app.isHidden { continue }
+            if isStalled(pid) { stalledPIDs.insert(pid); continue }
+            guard let wins = AX.windows(of: watcher.app, pid: pid) else {
+                markStalled(pid); stalledPIDs.insert(pid); continue
+            }
+            let excluded = app.bundleIdentifier.map { excludedIDs.contains($0) } ?? false
+            for w in wins {
+                seen.insert(w)
+                if tileable(w, excluded: excluded) { live.append(w) }
+            }
         }
+        standardWindows.formIntersection(seen)
+        for (pid, w) in watchers where !running.contains(pid) { w.stop(); watchers[pid] = nil }
+
         let liveSet = Set(live)
         let before = columns.count
-        columns.removeAll { !liveSet.contains($0.win) }
+        // Columns of an app that is not answering stay put until it recovers.
+        columns.removeAll { !liveSet.contains($0.win) && !stalledPIDs.contains($0.win.pid) }
         var changed = columns.count != before
         let known = Set(columns.map { $0.win })
         for w in live where !known.contains(w) {
             // New windows open right beside the focused column.
             let idx = columns.isEmpty ? 0 : min(focus + 1, columns.count)
             columns.insert(Column(win: w, width: settings.defaultWidth), at: idx)
+            watchers[w.pid]?.watchDestroyed(w)
             changed = true
         }
         focus = columns.isEmpty ? 0 : min(max(focus, 0), columns.count - 1)
         // Track the user's real focus (click / Cmd-Tab) without stealing it.
-        if let fw = AX.focusedWindow(), let i = columns.firstIndex(where: { $0.win == fw }), i != focus {
+        if let fw = AX.focusedWindow(), !isStalled(fw.pid),
+           let i = columns.firstIndex(where: { $0.win == fw }), i != focus {
             focus = i; ensureVisible(); changed = true
         }
         return changed
@@ -105,13 +231,26 @@ final class StripEngine {
     func layout() {
         guard enabled else { return }
         let a = screenArea
-        for (i, c) in columns.enumerated() {
+        var x = a.minX + gap - scroll
+        for c in columns {
             let w = colWidth(c)
-            let x = a.minX + gap + stripX(i) - scroll
             let r = CGRect(x: x, y: a.minY + gap, width: w, height: a.height - 2 * gap)
-            c.win.setFrame(AX.toAX(r))
+            x += w + gap
+            apply(AX.toAX(r).integral, to: c)
         }
         onLayout?()
+    }
+
+    /// Writes a frame only if it differs from the last one written, and only the position
+    /// when the size is unchanged (the common case while scrolling).
+    private func apply(_ r: CGRect, to c: Column) {
+        if c.applied == r || isStalled(c.win.pid) { return }
+        let err: AXError
+        if let last = c.applied, last.size == r.size { err = c.win.setPosition(r.origin) }
+        else { err = c.win.setFrame(r) }
+        c.wroteAt = Date()
+        if err == .cannotComplete { markStalled(c.win.pid) }
+        c.applied = err == .success ? r : nil
     }
 
     /// Short eased scroll animation toward the target scroll value.
@@ -200,4 +339,7 @@ final class StripEngine {
         columns[focus].win.focus()
         scrollToFocus()
     }
+
+    /// Re-applies every frame, e.g. after a manual re-tile.
+    func retile() { invalidateFrames(); refresh(); ensureVisible(); layout() }
 }

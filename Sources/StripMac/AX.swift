@@ -42,17 +42,25 @@ struct Win: Hashable {
         return CGRect(origin: p, size: s)
     }
 
-    /// Frame is in AX (top-left origin) global coordinates.
-    func setFrame(_ r: CGRect) {
+    /// Frame is in AX (top-left origin) global coordinates. Returns the first error that matters.
+    @discardableResult
+    func setFrame(_ r: CGRect) -> AXError {
         var p = r.origin, s = r.size
-        if let sv = AXValueCreate(.cgSize, &s) { AXUIElementSetAttributeValue(el, kAXSizeAttribute as CFString, sv) }
-        if let pv = AXValueCreate(.cgPoint, &p) { AXUIElementSetAttributeValue(el, kAXPositionAttribute as CFString, pv) }
-        if let sv = AXValueCreate(.cgSize, &s) { AXUIElementSetAttributeValue(el, kAXSizeAttribute as CFString, sv) }
+        guard let sv = AXValueCreate(.cgSize, &s), let pv = AXValueCreate(.cgPoint, &p) else { return .failure }
+        // Size, position, size: the second size fixes windows that couldn't grow at their old position.
+        let e1 = AXUIElementSetAttributeValue(el, kAXSizeAttribute as CFString, sv)
+        if e1 == .cannotComplete { return e1 }
+        let e2 = AXUIElementSetAttributeValue(el, kAXPositionAttribute as CFString, pv)
+        if e2 == .cannotComplete { return e2 }
+        let e3 = AXUIElementSetAttributeValue(el, kAXSizeAttribute as CFString, sv)
+        return e2 != .success ? e2 : e3
     }
 
-    func setPosition(_ pt: CGPoint) {
+    @discardableResult
+    func setPosition(_ pt: CGPoint) -> AXError {
         var p = pt
-        if let pv = AXValueCreate(.cgPoint, &p) { AXUIElementSetAttributeValue(el, kAXPositionAttribute as CFString, pv) }
+        guard let pv = AXValueCreate(.cgPoint, &p) else { return .failure }
+        return AXUIElementSetAttributeValue(el, kAXPositionAttribute as CFString, pv)
     }
 
     func focus() {
@@ -63,6 +71,10 @@ struct Win: Hashable {
 }
 
 enum AX {
+    /// Upper bound for any single Accessibility request. A hung app costs at most this per call
+    /// instead of the system default of about 6 s.
+    static let timeout: Float = 0.25
+
     static var trusted: Bool { AXIsProcessTrusted() }
 
     static func promptForTrust() {
@@ -70,12 +82,18 @@ enum AX {
         _ = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
     }
 
-    static func windows(of app: NSRunningApplication) -> [Win] {
-        let a = AXUIElementCreateApplication(app.processIdentifier)
+    /// Applies `timeout` to every Accessibility request this process makes.
+    static func configureTimeout() {
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), timeout)
+    }
+
+    /// The app's windows, or nil if the app did not answer in time.
+    static func windows(of app: AXUIElement, pid: pid_t) -> [Win]? {
         var v: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(a, kAXWindowsAttribute as CFString, &v) == .success,
-              let arr = v as? [AXUIElement] else { return [] }
-        return arr.map { Win(el: $0, pid: app.processIdentifier) }
+        let err = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &v)
+        if err == .cannotComplete { return nil }
+        guard err == .success, let arr = v as? [AXUIElement] else { return [] }
+        return arr.map { Win(el: $0, pid: pid) }
     }
 
     static func focusedWindow() -> Win? {
@@ -90,5 +108,45 @@ enum AX {
     static func toAX(_ r: CGRect) -> CGRect {
         let h = NSScreen.screens.first?.frame.height ?? 0
         return CGRect(x: r.minX, y: h - r.maxY, width: r.width, height: r.height)
+    }
+}
+
+/// Per-app Accessibility element plus an AXObserver that reports window events,
+/// so the strip reacts to changes without polling every window.
+final class AppWatcher {
+    let pid: pid_t
+    let app: AXUIElement
+    private var observer: AXObserver?
+    private let refcon: UnsafeMutableRawPointer
+
+    private static let appNotifications = [
+        kAXWindowCreatedNotification, kAXFocusedWindowChangedNotification,
+        kAXWindowMiniaturizedNotification, kAXWindowDeminiaturizedNotification,
+        kAXApplicationHiddenNotification, kAXApplicationShownNotification,
+        kAXWindowMovedNotification, kAXWindowResizedNotification,
+    ]
+
+    init(pid: pid_t, callback: AXObserverCallback, refcon: UnsafeMutableRawPointer) {
+        self.pid = pid
+        self.refcon = refcon
+        app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, AX.timeout)
+        var obs: AXObserver?
+        guard AXObserverCreate(pid, callback, &obs) == .success, let obs else { return }
+        for n in Self.appNotifications { AXObserverAddNotification(obs, app, n as CFString, refcon) }
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(obs), .commonModes)
+        observer = obs
+    }
+
+    /// Window destruction is only reported to observers registered on the window itself.
+    func watchDestroyed(_ w: Win) {
+        guard let observer else { return }
+        AXObserverAddNotification(observer, w.el, kAXUIElementDestroyedNotification as CFString, refcon)
+    }
+
+    func stop() {
+        guard let observer else { return }
+        CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        self.observer = nil
     }
 }
