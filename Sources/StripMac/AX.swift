@@ -25,7 +25,6 @@ struct Win: Hashable {
         return AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &v) == .success
     }
 
-    var title: String { attr(kAXTitleAttribute) ?? "" }
     var subrole: String { attr(kAXSubroleAttribute) ?? "" }
     var isMinimized: Bool { (attr(kAXMinimizedAttribute) as Bool?) ?? false }
     var isFullscreen: Bool { (attr("AXFullScreen") as Bool?) ?? false }
@@ -41,14 +40,19 @@ struct Win: Hashable {
         return settable.boolValue
     }
 
+    /// An attribute's AXValue, type-checked before it is treated as one.
+    private func axValue(_ name: String) -> AXValue? {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, name as CFString, &v) == .success, let v,
+              CFGetTypeID(v) == AXValueGetTypeID() else { return nil }
+        return unsafeBitCast(v, to: AXValue.self)
+    }
+
+    /// Frame in AX (top-left origin) global coordinates.
     var frame: CGRect? {
-        var pv: CFTypeRef?, sv: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(el, kAXPositionAttribute as CFString, &pv) == .success,
-              AXUIElementCopyAttributeValue(el, kAXSizeAttribute as CFString, &sv) == .success,
-              let pv, let sv else { return nil }
+        guard let pv = axValue(kAXPositionAttribute), let sv = axValue(kAXSizeAttribute) else { return nil }
         var p = CGPoint.zero, s = CGSize.zero
-        AXValueGetValue(pv as! AXValue, .cgPoint, &p)
-        AXValueGetValue(sv as! AXValue, .cgSize, &s)
+        guard AXValueGetValue(pv, .cgPoint, &p), AXValueGetValue(sv, .cgSize, &s) else { return nil }
         return CGRect(origin: p, size: s)
     }
 
@@ -128,8 +132,9 @@ enum AX {
         guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
         let a = AXUIElementCreateApplication(app.processIdentifier)
         var v: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(a, kAXFocusedWindowAttribute as CFString, &v) == .success, let v else { return nil }
-        return Win(el: v as! AXUIElement, pid: app.processIdentifier)
+        guard AXUIElementCopyAttributeValue(a, kAXFocusedWindowAttribute as CFString, &v) == .success, let v,
+              CFGetTypeID(v) == AXUIElementGetTypeID() else { return nil }
+        return Win(el: unsafeBitCast(v, to: AXUIElement.self), pid: app.processIdentifier)
     }
 
     /// Converts a Cocoa (bottom-left) rect to AX (top-left) coordinates.
