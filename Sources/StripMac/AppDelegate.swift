@@ -82,6 +82,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self, Settings.shared.showMinimap else { return }
             self.minimap.show(engine: self.engine)
         }
+        engine.onAccessChanged = { [weak self] granted in
+            // Revoked while running: explain and wait; the engine resumes on its own once granted.
+            if granted { self?.onboardingWindow?.close() } else { self?.showOnboarding() }
+        }
         engine.start()
         let bindings = DefaultBindings.all(engine: engine, toggle: { [weak self] in self?.toggle() })
         bindings.forEach { Hotkeys.shared.register($0) }

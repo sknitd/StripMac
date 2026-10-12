@@ -8,6 +8,7 @@ extension NSScreen {
 final class Column {
     var win: Win
     var width: Double   // fraction of usable screen width
+    var widthBeforeFull: Double?   // restored when full width is toggled off
     var applied: CGRect?     // last frame written to the window (AX coords); nil = unknown
     var wroteAt: Date?       // when we last wrote it, to tell our own moves from the user's
     init(win: Win, width: Double) { self.win = win; self.width = width }
@@ -35,6 +36,9 @@ final class StripEngine {
         }
     }
     var onLayout: (() -> Void)?
+    /// Called with false when Accessibility access is revoked, and true when it is back.
+    var onAccessChanged: ((Bool) -> Void)?
+    private(set) var accessLost = false
 
     private var timer: Timer?
     private var anim: Timer?
@@ -46,7 +50,7 @@ final class StripEngine {
     private var standardWindows: Set<Win> = []        // cache: standard subrole and resizable
     private var refreshWork: DispatchWorkItem?
     private var geometryWork: DispatchWorkItem?
-    private var geometryPending: Set<Win> = []
+    private var geometryPending: [Win: Bool] = [:]    // window → was resized
     private var observers: [NSObjectProtocol] = []
     /// Window we just asked to focus. App activation is asynchronous, so until it reports focus
     /// (or the deadline passes) the system's stale focused window must not override ours.
@@ -76,9 +80,10 @@ final class StripEngine {
         AX.configureTimeout()
         refresh(); layout()
         // Safety-net poll; AXObserver notifications handle most changes as they happen.
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            self?.tick()
-        }
+        // Common run-loop modes keep it running while a menu is open or a slider is dragged.
+        let t = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
         settings.onChange = { [weak self] in self?.ensureVisible(); self?.layout() }
         let wnc = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didActivateApplicationNotification, NSWorkspace.didLaunchApplicationNotification,
@@ -103,7 +108,7 @@ final class StripEngine {
     private func screensChanged() {
         screenWork?.cancel()
         let w = DispatchWorkItem { [weak self] in
-            guard let self, self.enabled else { return }
+            guard let self, self.enabled, !self.accessLost else { return }
             self.invalidateFrames()
             self.refresh()
             self.ensureVisible()
@@ -114,6 +119,18 @@ final class StripEngine {
     }
 
     private func tick() {
+        // Accessibility can be revoked while running: every AX call would fail and refresh would
+        // empty the strip. Freeze instead, and pick up again once access comes back.
+        guard AX.trusted else {
+            if !accessLost { accessLost = true; anim?.invalidate(); onAccessChanged?(false) }
+            return
+        }
+        if accessLost {
+            accessLost = false
+            onAccessChanged?(true)
+            if enabled { invalidateFrames(); refresh(); ensureVisible(); layout() }
+            return
+        }
         guard enabled else { return }
         let stallEnded = expireStalls()
         if refresh() || stallEnded { layout() }
@@ -144,10 +161,10 @@ final class StripEngine {
     }
 
     fileprivate func handleAXNotification(_ name: String, element: AXUIElement) {
-        guard enabled else { return }
+        guard enabled, !accessLost else { return }
         switch name {
         case kAXWindowMovedNotification, kAXWindowResizedNotification:
-            geometryChanged(element)
+            geometryChanged(element, resized: name == kAXWindowResizedNotification)
         default:
             scheduleRefresh()
         }
@@ -157,7 +174,7 @@ final class StripEngine {
     func scheduleRefresh() {
         refreshWork?.cancel()
         let w = DispatchWorkItem { [weak self] in
-            guard let self, self.enabled else { return }
+            guard let self, self.enabled, !self.accessLost else { return }
             if self.refresh() { self.layout() }
         }
         refreshWork = w
@@ -165,11 +182,12 @@ final class StripEngine {
     }
 
     /// A column window moved or resized. Our own writes echo back here, so ignore anything
-    /// right after a write; otherwise forget the cached frame so the next layout puts it back.
-    private func geometryChanged(_ el: AXUIElement) {
+    /// right after a write. Otherwise, once the user lets go: a new width becomes the column's
+    /// width, and anything else is put back in place by the next layout.
+    private func geometryChanged(_ el: AXUIElement, resized: Bool) {
         guard let c = columns.first(where: { CFEqual($0.win.el, el) }) else { return }
         if let t = c.wroteAt, Date().timeIntervalSince(t) < 0.4 { return }
-        geometryPending.insert(c.win)
+        geometryPending[c.win] = (geometryPending[c.win] ?? false) || resized
         geometryWork?.cancel()
         let w = DispatchWorkItem { [weak self] in self?.processGeometryChanges() }
         geometryWork = w
@@ -181,11 +199,16 @@ final class StripEngine {
         geometryPending = []
         var changed = false
         var dragged: Set<Win> = []
-        for c in columns where pending.contains(c.win) {
-            guard let f = c.win.frame else { continue }
+        for c in columns {
+            guard let resized = pending[c.win], let f = c.win.frame else { continue }
             if let last = c.applied, Self.approxEqual(f, last) { continue }
-            // Dragged onto another display: it leaves the strip and floats there.
-            if let id = displayID(containing: f), id != stripScreen?.displayID { dragged.insert(c.win) }
+            if resized, abs(f.width - (c.applied?.width ?? colWidth(c))) >= 2 {
+                c.width = min(1.0, max(0.1, Double((f.width + gap) / (usableWidth + gap))))
+                c.widthBeforeFull = nil
+            } else if !resized, let id = displayID(containing: f), id != stripScreen?.displayID {
+                // Dragged onto another display: it leaves the strip and floats there.
+                dragged.insert(c.win)
+            }
             c.applied = nil
             changed = true
         }
@@ -193,7 +216,7 @@ final class StripEngine {
             _ = removeColumns { dragged.contains($0.win) }
             ensureVisible()
         }
-        if changed { layout() }
+        if changed { ensureVisible(); layout() }
     }
 
     static func approxEqual(_ a: CGRect, _ b: CGRect, tolerance t: CGFloat = 2) -> Bool {
@@ -419,10 +442,10 @@ final class StripEngine {
 
     // MARK: Geometry
 
-    private func colWidth(_ c: Column) -> CGFloat { max(150, (usableWidth + gap) * CGFloat(c.width) - gap) }
+    func colWidth(_ c: Column) -> CGFloat { max(150, (usableWidth + gap) * CGFloat(c.width) - gap) }
 
     /// x of a column's left edge in strip space (0 = start of strip).
-    private func stripX(_ i: Int) -> CGFloat {
+    func stripX(_ i: Int) -> CGFloat {
         var x: CGFloat = 0
         for j in 0..<min(i, columns.count) { x += colWidth(columns[j]) + gap }
         return x
@@ -446,16 +469,29 @@ final class StripEngine {
         clampScroll()
     }
 
-    private func clampScroll() {
-        let maxS = max(0, stripLength - usableWidth)
-        if settings.centerMode == .always { return }
-        scroll = min(max(scroll, 0), maxS)
+    /// How far the strip may scroll. In "always centre" mode the first and last columns may sit
+    /// in the middle of the screen; otherwise the strip never scrolls past its ends.
+    private var scrollRange: ClosedRange<CGFloat> {
+        guard let last = columns.last else { return 0...0 }
+        if settings.centerMode == .always {
+            let lo = colWidth(columns[0]) / 2 - usableWidth / 2
+            let hi = stripX(columns.count - 1) + colWidth(last) / 2 - usableWidth / 2
+            return lo...max(lo, hi)
+        }
+        return 0...max(0, stripLength - usableWidth)
     }
+
+    private func clamped(_ s: CGFloat) -> CGFloat {
+        let r = scrollRange
+        return min(max(s, r.lowerBound), r.upperBound)
+    }
+
+    private func clampScroll() { scroll = clamped(scroll) }
 
     /// Applies frames. Columns that don't reach the strip's display are parked beyond the
     /// outer edge of *all* displays, so they never show up on a neighbouring one.
     func layout() {
-        guard enabled, let scr = stripScreen else { return }
+        guard enabled, !accessLost, let scr = stripScreen else { return }
         let a = scr.visibleFrame, disp = scr.frame
         // During display sleep or reconfiguration the frame can be empty: write nothing.
         guard a.width >= 300, a.height >= 200 else { return }
@@ -489,15 +525,17 @@ final class StripEngine {
         anim?.invalidate()
         let from = scroll, steps = 8
         var n = 0
-        anim = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] t in
-            guard let self else { t.invalidate(); return }
+        let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
+            guard let self else { timer.invalidate(); return }
             n += 1
             let p = CGFloat(n) / CGFloat(steps)
             let e = 1 - pow(1 - p, 3)
             self.scroll = from + (target - from) * e
             self.layout()
-            if n >= steps { t.invalidate() }
+            if n >= steps { timer.invalidate() }
         }
+        RunLoop.main.add(t, forMode: .common)
+        anim = t
     }
 
     private func scrollToFocus() {
@@ -538,22 +576,31 @@ final class StripEngine {
         guard columns.indices.contains(focus) else { return }
         let p = settings.presets, cur = columns[focus].width
         columns[focus].width = p.first(where: { $0 > cur + 0.01 }) ?? p[0]
+        columns[focus].widthBeforeFull = nil
         ensureVisible(); layout()
     }
     func nudgeWidth(_ delta: Double) {
         guard columns.indices.contains(focus) else { return }
         columns[focus].width = min(1.0, max(0.15, columns[focus].width + delta))
+        columns[focus].widthBeforeFull = nil
         ensureVisible(); layout()
     }
     func fullWidth() {
         guard columns.indices.contains(focus) else { return }
-        columns[focus].width = columns[focus].width >= 0.99 ? settings.defaultWidth : 1.0
+        let c = columns[focus]
+        if c.width >= 0.99 {
+            c.width = c.widthBeforeFull ?? settings.defaultWidth
+            c.widthBeforeFull = nil
+        } else {
+            c.widthBeforeFull = c.width
+            c.width = 1.0
+        }
         ensureVisible(); layout()
     }
     func center() {
         guard columns.indices.contains(focus) else { return }
         let x = stripX(focus), w = colWidth(columns[focus])
-        animate(to: x + w / 2 - usableWidth / 2)
+        animate(to: clamped(x + w / 2 - usableWidth / 2))
     }
     func equalize() {
         for c in columns { c.width = settings.defaultWidth }
@@ -564,7 +611,7 @@ final class StripEngine {
 
     func scrollBy(_ dx: CGFloat) {
         anim?.invalidate()
-        scroll += dx
+        scroll = clamped(scroll + dx)
         layout()
     }
 
