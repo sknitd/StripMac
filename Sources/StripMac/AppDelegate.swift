@@ -17,7 +17,7 @@ private func crashSignalHandler(_ sig: Int32) {
     raise(sig)
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     let engine = StripEngine()
     private var status: NSStatusItem!
     private var gestures: Gestures?
@@ -107,7 +107,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                              styleMask: [.titled, .closable], backing: .buffered, defer: false)
             w.title = "StripMac Settings"
             w.isReleasedWhenClosed = false
-            w.contentView = NSHostingView(rootView: SettingsView(bindings: DefaultBindings.all(engine: engine, toggle: {}).map { $0.name }))
+            let names = DefaultBindings.all(engine: engine, toggle: {}).map { $0.name }
+            w.contentView = NSHostingView(rootView: SettingsView(s: Settings.shared, hotkeys: Hotkeys.shared, bindings: names))
             w.center()
             settingsWindow = w
         }
@@ -122,6 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             w.title = "Welcome to StripMac"
             w.isReleasedWhenClosed = false
             w.contentView = NSHostingView(rootView: OnboardingView())
+            w.delegate = self
             w.center()
             onboardingWindow = w
         }
@@ -133,6 +135,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         trustTimer?.invalidate()
         trustTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] t in
             if AX.trusted { t.invalidate(); self?.startEngine() }
+        }
+    }
+
+    /// Drop the onboarding window once closed, so its view (and its 1 s status timer) goes away.
+    func windowWillClose(_ n: Notification) {
+        guard let w = n.object as? NSWindow, w === onboardingWindow else { return }
+        DispatchQueue.main.async { [weak self] in
+            if self?.onboardingWindow === w { self?.onboardingWindow = nil }
         }
     }
 }
@@ -174,7 +184,8 @@ struct OnboardingView: View {
 }
 
 struct SettingsView: View {
-    @ObservedObject var s = Settings.shared
+    @ObservedObject var s: Settings
+    @ObservedObject var hotkeys: Hotkeys
     let bindings: [String]
     @State private var loginStatus = SMAppService.mainApp.status
     @State private var loginError: String?
@@ -233,7 +244,16 @@ struct SettingsView: View {
             .padding()
             .tabItem { Label("Rules", systemImage: "list.bullet") }
 
-            List(bindings, id: \.self) { Text($0).font(.system(.body, design: .monospaced)) }
+            List(bindings, id: \.self) { name in
+                HStack {
+                    Text(name).font(.system(.body, design: .monospaced))
+                    if hotkeys.failed.contains(name) {
+                        Spacer()
+                        Label("Taken by another app", systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
                 .tabItem { Label("Shortcuts", systemImage: "keyboard") }
         }
         .frame(width: 520, height: 480)

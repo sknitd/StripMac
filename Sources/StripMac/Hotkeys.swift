@@ -2,8 +2,10 @@ import AppKit
 import Carbon.HIToolbox
 
 /// Global hotkeys via Carbon RegisterEventHotKey (no Input Monitoring permission needed).
-final class Hotkeys {
+final class Hotkeys: ObservableObject {
     static let shared = Hotkeys()
+    /// Names of bindings that could not be registered (usually taken by another app).
+    @Published private(set) var failed: Set<String> = []
     private var actions: [UInt32: () -> Void] = [:]
     private var refs: [EventHotKeyRef] = []
     private var nextID: UInt32 = 1
@@ -34,12 +36,18 @@ final class Hotkeys {
         var ref: EventHotKeyRef?
         let hkID = EventHotKeyID(signature: OSType(0x5354_5250), id: id) // 'STRP'
         let st = RegisterEventHotKey(UInt32(b.key), UInt32(b.mods), hkID, GetApplicationEventTarget(), 0, &ref)
-        if st == noErr, let ref { refs.append(ref); actions[id] = b.action }
+        if st == noErr, let ref {
+            refs.append(ref); actions[id] = b.action
+            failed.remove(b.name)
+        } else {
+            NSLog("StripMac: could not register hotkey \"%@\" (error %ld)", b.name, Int(st))
+            failed.insert(b.name)
+        }
     }
 
     func unregisterAll() {
         for r in refs { UnregisterEventHotKey(r) }
-        refs.removeAll(); actions.removeAll()
+        refs.removeAll(); actions.removeAll(); failed.removeAll()
     }
 }
 
