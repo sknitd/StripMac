@@ -177,10 +177,13 @@ final class AppWatcher {
         observer = obs
     }
 
-    /// Window destruction is only reported to observers registered on the window itself.
-    func watchDestroyed(_ w: Win) {
+    /// Destruction is only reported to observers registered on the window itself; moves and
+    /// resizes are registered there too, since not every app forwards them to the app element.
+    func watchWindow(_ w: Win) {
         guard let observer else { return }
-        AXObserverAddNotification(observer, w.el, kAXUIElementDestroyedNotification as CFString, refcon)
+        for n in [kAXUIElementDestroyedNotification, kAXMovedNotification, kAXResizedNotification] {
+            AXObserverAddNotification(observer, w.el, n as CFString, refcon)
+        }
     }
 
     func stop() {

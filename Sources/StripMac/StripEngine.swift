@@ -173,8 +173,10 @@ final class StripEngine {
     fileprivate func handleAXNotification(_ name: String, element: AXUIElement) {
         guard enabled, !accessLost else { return }
         switch name {
-        case kAXWindowMovedNotification, kAXWindowResizedNotification:
-            geometryChanged(element, resized: name == kAXWindowResizedNotification)
+        case kAXWindowMovedNotification, kAXMovedNotification:
+            geometryChanged(element, resized: false)
+        case kAXWindowResizedNotification, kAXResizedNotification:
+            geometryChanged(element, resized: true)
         default:
             scheduleRefresh()
         }
@@ -350,7 +352,7 @@ final class StripEngine {
                   !c.win.isMinimized else { continue }
             c.win = newcomers.remove(at: j)
             c.applied = nil
-            watchers[c.win.pid]?.watchDestroyed(c.win)
+            watchers[c.win.pid]?.watchWindow(c.win)
             changed = true
         }
 
@@ -376,7 +378,7 @@ final class StripEngine {
             suspended[w] = nil
             let afterLeft = s.left.flatMap { l in columns.firstIndex { $0.win == l } }.map { $0 + 1 }
             columns.insert(Column(win: w, width: s.width), at: afterLeft ?? min(s.index, columns.count))
-            watchers[w.pid]?.watchDestroyed(w)
+            watchers[w.pid]?.watchWindow(w)
             changed = true
         }
         let back = Set(returning.map { $0.0 })
@@ -386,7 +388,7 @@ final class StripEngine {
         for w in newcomers where !back.contains(w) && admits(frame: frames[w]) {
             columns.insert(Column(win: w, width: settings.defaultWidth), at: insertAt)
             insertAt += 1
-            watchers[w.pid]?.watchDestroyed(w)
+            watchers[w.pid]?.watchWindow(w)
             changed = true
         }
         if let fw = focusedWin, let i = columns.firstIndex(where: { $0.win == fw }) { focus = i }

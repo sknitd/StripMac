@@ -40,7 +40,7 @@ final class Gestures {
     func syncEnabled() { tap?.enabled = Settings.shared.gesturesEnabled && engine.enabled }
 
     private func perform(_ action: ScrollTap.Action) {
-        guard Settings.shared.gesturesEnabled, engine.enabled else { return }
+        guard Settings.shared.gesturesEnabled, engine.enabled, !engine.accessLost else { return }
         switch action {
         case .scroll(let dx):
             snapWork?.cancel()
