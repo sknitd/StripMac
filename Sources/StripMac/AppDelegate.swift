@@ -123,6 +123,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         NSApp.activate(ignoringOtherApps: true)
         onboardingWindow?.makeKeyAndOrderFront(nil)
+        // Only wait for the permission before tiling has started; opened later from the menu,
+        // the window stays until the user closes it.
+        guard !started else { return }
         trustTimer?.invalidate()
         trustTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] t in
             if AX.trusted { t.invalidate(); self?.startEngine() }
@@ -169,7 +172,25 @@ struct OnboardingView: View {
 struct SettingsView: View {
     @ObservedObject var s = Settings.shared
     let bindings: [String]
-    @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @State private var loginStatus = SMAppService.mainApp.status
+    @State private var loginError: String?
+
+    /// Reflects the real service status; the setter calls the service once and re-reads the
+    /// status, so a failure can't bounce the toggle back and forth.
+    private var launchAtLogin: Binding<Bool> {
+        Binding(get: { loginStatus == .enabled || loginStatus == .requiresApproval },
+                set: { on in setLaunchAtLogin(on) })
+    }
+
+    private func setLaunchAtLogin(_ on: Bool) {
+        loginError = nil
+        do {
+            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+        } catch {
+            loginError = error.localizedDescription
+        }
+        loginStatus = SMAppService.mainApp.status
+    }
 
     var body: some View {
         TabView {
@@ -186,11 +207,16 @@ struct SettingsView: View {
                 }
                 Toggle("Trackpad swipe navigation (⌃⌥ + scroll)", isOn: $s.gesturesEnabled)
                 Toggle("Show strip minimap while navigating", isOn: $s.showMinimap)
-                Toggle("Launch at login", isOn: $launchAtLogin)
-                    .onChange(of: launchAtLogin) { _, on in
-                        do { if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() } }
-                        catch { launchAtLogin = !on }
+                Toggle("Launch at login", isOn: launchAtLogin)
+                if loginStatus == .requiresApproval {
+                    HStack {
+                        Text("Allow StripMac in Login Items to finish.").foregroundStyle(.secondary)
+                        Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
                     }
+                }
+                if let loginError {
+                    Text(loginError).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                }
             }
             .padding()
             .tabItem { Label("General", systemImage: "gearshape") }
