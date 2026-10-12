@@ -109,6 +109,12 @@ enum AX {
         let h = NSScreen.screens.first?.frame.height ?? 0
         return CGRect(x: r.minX, y: h - r.maxY, width: r.width, height: r.height)
     }
+
+    /// Converts a point between Cocoa and AX coordinates (the flip is its own inverse).
+    static func flip(_ p: CGPoint) -> CGPoint {
+        let h = NSScreen.screens.first?.frame.height ?? 0
+        return CGPoint(x: p.x, y: h - p.y)
+    }
 }
 
 /// Per-app Accessibility element plus an AXObserver that reports window events,

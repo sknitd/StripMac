@@ -22,7 +22,13 @@ final class StripEngine {
     private(set) var columns: [Column] = []
     private(set) var focus = 0
     private(set) var scroll: CGFloat = 0     // strip x-offset in points
-    var enabled = true { didSet { if enabled { invalidateFrames(); refresh(); layout() } } }
+    var enabled = true {
+        didSet {
+            guard enabled != oldValue else { return }
+            if enabled { invalidateFrames(); refresh(); ensureVisible(); layout() }
+            else { anim?.invalidate(); releaseWindows() }
+        }
+    }
     var onLayout: (() -> Void)?
 
     private var timer: Timer?
@@ -173,7 +179,11 @@ final class StripEngine {
         let liveSet = Set(live)
         let before = columns.count
         // Columns of an app that is not answering stay put until it recovers.
+        let leaving = columns.filter { !liveSet.contains($0.win) && !stalledPIDs.contains($0.win.pid) }
         columns.removeAll { !liveSet.contains($0.win) && !stalledPIDs.contains($0.win.pid) }
+        // A window that left the strip without closing (floated, minimised and restored, …)
+        // may still be parked off-screen: bring it back.
+        for c in leaving where seen.contains(c.win) || c.win.isAlive { rescueIfOffScreen(c.win) }
         var changed = columns.count != before
         let known = Set(columns.map { $0.win })
         for w in live where !known.contains(w) {
@@ -190,6 +200,39 @@ final class StripEngine {
             focus = i; ensureVisible(); changed = true
         }
         return changed
+    }
+
+    // MARK: Putting windows back
+
+    /// Moves every window the strip manages back on-screen. Called when tiling stops,
+    /// on quit, and from the termination/crash handlers.
+    func releaseWindows() {
+        anim?.invalidate()
+        for c in columns where !isStalled(c.win.pid) {
+            clampOnScreen(c.win)
+            c.applied = nil
+        }
+    }
+
+    /// Clamps a window into the visible area of the strip's display.
+    private func clampOnScreen(_ w: Win, frame: CGRect? = nil) {
+        guard let scr = NSScreen.main, w.isAlive, !w.isFullscreen, var r = frame ?? w.frame else { return }
+        let vis = AX.toAX(scr.visibleFrame)
+        guard vis.width > 0, vis.height > 0 else { return }
+        let orig = r
+        r.size.width = min(r.width, vis.width)
+        r.size.height = min(r.height, vis.height)
+        r.origin.x = min(max(r.minX, vis.minX), vis.maxX - r.width)
+        r.origin.y = min(max(r.minY, vis.minY), vis.maxY - r.height)
+        if r != orig { w.setFrame(r.integral) }
+    }
+
+    /// Clamps a window on-screen only if its centre is not on any display.
+    private func rescueIfOffScreen(_ w: Win) {
+        guard !w.isMinimized, let f = w.frame else { return }
+        let centre = AX.flip(CGPoint(x: f.midX, y: f.midY))
+        if NSScreen.screens.contains(where: { $0.frame.contains(centre) }) { return }
+        clampOnScreen(w, frame: f)
     }
 
     // MARK: Geometry

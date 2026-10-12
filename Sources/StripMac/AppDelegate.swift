@@ -2,6 +2,21 @@ import AppKit
 import SwiftUI
 import ServiceManagement
 
+private let crashSignals: [Int32] = [SIGABRT, SIGILL, SIGTRAP, SIGSEGV, SIGBUS, SIGFPE]
+
+/// Last-ditch attempt to put parked windows back before the process dies.
+/// Accessibility calls are not async-signal-safe, so this is best effort and main-thread only.
+private func releaseWindowsBeforeDying() {
+    guard Thread.isMainThread else { return }
+    MainActor.assumeIsolated { (NSApp.delegate as? AppDelegate)?.releaseWindows() }
+}
+
+private func crashSignalHandler(_ sig: Int32) {
+    for s in crashSignals { signal(s, SIG_DFL) }
+    releaseWindowsBeforeDying()
+    raise(sig)
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let engine = StripEngine()
     private var status: NSStatusItem!
@@ -12,9 +27,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var toggleItem: NSMenuItem!
     let minimap = Minimap()
 
+    private var signalSources: [DispatchSourceSignal] = []
+
     func applicationDidFinishLaunching(_ n: Notification) {
         buildMenu()
+        installTerminationHandlers()
         if AX.trusted { startEngine() } else { showOnboarding() }
+    }
+
+    func applicationWillTerminate(_ n: Notification) { releaseWindows() }
+
+    /// Puts every managed window back on-screen so nothing stays parked past the screen edge.
+    func releaseWindows() {
+        guard started else { return }
+        engine.releaseWindows()
+    }
+
+    /// Quits cleanly (restoring windows) on SIGTERM/SIGINT/SIGHUP, and tries to restore
+    /// windows on crashes and uncaught exceptions.
+    private func installTerminationHandlers() {
+        for sig in [SIGTERM, SIGINT, SIGHUP] {
+            signal(sig, SIG_IGN)
+            let src = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+            src.setEventHandler { MainActor.assumeIsolated { NSApp.terminate(nil) } }
+            src.resume()
+            signalSources.append(src)
+        }
+        for sig in crashSignals { signal(sig, crashSignalHandler) }
+        NSSetUncaughtExceptionHandler { _ in releaseWindowsBeforeDying() }
     }
 
     private func buildMenu() {
