@@ -4,7 +4,7 @@ import AppKit
 MainActor.assumeIsolated {
     let app = NSApplication.shared
     let delegate = AppDelegate()
-    app.delegate = delegate
+    app.delegate = delegate   // weak: keep our reference alive for as long as the app runs
     app.setActivationPolicy(.accessory)
-    app.run()
+    withExtendedLifetime(delegate) { app.run() }
 }
