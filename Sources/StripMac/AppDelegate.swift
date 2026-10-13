@@ -59,8 +59,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func buildMenu() {
+        // New status items are added at the far left of the icon area, which on a crowded notched
+        // MacBook lands behind the notch and is hidden. Seed a position near the clock instead
+        // (points from the right screen edge); after a ⌘-drag, macOS saves the user's choice here.
+        let posKey = "NSStatusItem Preferred Position StripMac"
+        if UserDefaults.standard.object(forKey: posKey) == nil { UserDefaults.standard.set(260, forKey: posKey) }
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        status.button?.image = NSImage(systemSymbolName: "rectangle.split.3x1", accessibilityDescription: "StripMac")
+        status.autosaveName = "StripMac"
+        status.button?.image = Self.stripGlyph()
         let m = NSMenu()
         toggleItem = NSMenuItem(title: "Stop Tiling", action: #selector(toggle), keyEquivalent: "")
         m.addItem(toggleItem)
@@ -72,6 +78,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         m.addItem(NSMenuItem(title: "Quit StripMac", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         for i in m.items where i.action != #selector(NSApplication.terminate(_:)) { i.target = self }
         status.menu = m
+    }
+
+    /// Menu-bar glyph: a solid focused column flanked by two outlined columns that run off the
+    /// edges, with chevrons hinting that the strip scrolls. Template image, so it follows the menu bar tint.
+    private static func stripGlyph() -> NSImage {
+        let img = NSImage(size: NSSize(width: 24, height: 18), flipped: false) { _ in
+            NSColor.black.set()
+            NSBezierPath(roundedRect: NSRect(x: 8.5, y: 2, width: 7, height: 14), xRadius: 1.8, yRadius: 1.8).fill()
+            for x in [3.0, 17.0] {
+                let side = NSBezierPath(roundedRect: NSRect(x: x, y: 4, width: 4, height: 10), xRadius: 1.2, yRadius: 1.2)
+                side.lineWidth = 1.3
+                side.stroke()
+            }
+            let chevrons = NSBezierPath()
+            chevrons.move(to: NSPoint(x: 1.8, y: 7)); chevrons.line(to: NSPoint(x: 0.4, y: 9)); chevrons.line(to: NSPoint(x: 1.8, y: 11))
+            chevrons.move(to: NSPoint(x: 22.2, y: 7)); chevrons.line(to: NSPoint(x: 23.6, y: 9)); chevrons.line(to: NSPoint(x: 22.2, y: 11))
+            chevrons.lineWidth = 1.2
+            chevrons.lineCapStyle = .round
+            chevrons.lineJoinStyle = .round
+            chevrons.stroke()
+            return true
+        }
+        img.isTemplate = true
+        img.accessibilityDescription = "StripMac"
+        return img
     }
 
     private var started = false
