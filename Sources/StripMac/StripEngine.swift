@@ -32,6 +32,12 @@ private func axObserverCallback(_ observer: AXObserver, _ element: AXUIElement,
     MainActor.assumeIsolated { engine.handleAXNotification(name, element: element) }
 }
 
+/// Lets the writer's background callback reach the engine; only dereferenced on the main thread.
+private struct WeakEngine: @unchecked Sendable {
+    weak var engine: StripEngine?
+    init(_ e: StripEngine) { engine = e }
+}
+
 /// One infinite horizontal strip of full-height columns, pinned to one display.
 @MainActor
 final class StripEngine {
@@ -42,7 +48,7 @@ final class StripEngine {
         didSet {
             guard enabled != oldValue else { return }
             if enabled { invalidateFrames(); refresh(); ensureVisible(); layout() }
-            else { anim?.invalidate(); releaseWindows() }
+            else { anim.stop(); timeline = nil; releaseWindows() }
         }
     }
     var onLayout: (@MainActor () -> Void)?
@@ -51,7 +57,14 @@ final class StripEngine {
     private(set) var accessLost = false
 
     private var timer: Timer?
-    private var anim: Timer?
+    private let anim = FrameDriver()
+    private var timeline: Timeline?
+    private lazy var writer: AXWriter = {
+        let me = WeakEngine(self)
+        return AXWriter { win, rect, err in
+            DispatchQueue.main.async { MainActor.assumeIsolated { me.engine?.writeFinished(win, rect, err) } }
+        }
+    }()
     private let settings = Settings.shared
     private let selfPID = ProcessInfo.processInfo.processIdentifier
 
@@ -65,6 +78,7 @@ final class StripEngine {
     /// Window we just asked to focus. App activation is asynchronous, so until it reports focus
     /// (or the deadline passes) the system's stale focused window must not override ours.
     private var expectedFocus: (win: Win, until: Date)?
+    private var awayInFullScreen = false   // the last refresh found a full-screen app in front
     private var screenWork: DispatchWorkItem?
 
     /// Windows that left the strip but are still alive (minimised, fullscreen, hidden app,
@@ -132,7 +146,7 @@ final class StripEngine {
         // Accessibility can be revoked while running: every AX call would fail and refresh would
         // empty the strip. Freeze instead, and pick up again once access comes back.
         guard AX.trusted else {
-            if !accessLost { accessLost = true; anim?.invalidate(); onAccessChanged?(false) }
+            if !accessLost { accessLost = true; anim.stop(); timeline = nil; onAccessChanged?(false) }
             return
         }
         if accessLost {
@@ -301,6 +315,13 @@ final class StripEngine {
     @discardableResult
     func refresh() -> Bool {
         guard stripScreen != nil else { return false }
+        // In a full-screen app's Space every strip window is on another Space, so they would all
+        // leave the strip and then be re-inserted and resized together on the way back, visibly
+        // jumping while the desktop slides in. Leave the strip exactly as it is instead: coming
+        // back needs no writes at all.
+        if !columns.isEmpty, Spaces.inFullScreenSpace { awayInFullScreen = true; return false }
+        let backFromFullScreen = awayInFullScreen
+        awayInFullScreen = false
         let onScreen = AX.onScreenWindowIDs()
         var live: [Win] = [], floating = Set<Win>(), seen = Set<Win>()
         var running = Set<pid_t>(), stalledPIDs = Set<pid_t>()
@@ -394,12 +415,14 @@ final class StripEngine {
         if let fw = focusedWin, let i = columns.firstIndex(where: { $0.win == fw }) { focus = i }
         focus = columns.isEmpty ? 0 : min(max(focus, 0), columns.count - 1)
         if changed { clampScroll() }
-        if syncFocusFromSystem() { changed = true }
+        if syncFocusFromSystem(quiet: backFromFullScreen) { changed = true }
         return changed
     }
 
-    /// Tracks the user's real focus (click / ⌘-Tab) without stealing it.
-    private func syncFocusFromSystem() -> Bool {
+    /// Tracks the user's real focus (click / ⌘-Tab) without stealing it. `quiet`: just back from a
+    /// full-screen app, the desktop has slid in showing the strip as it was left; don't scroll
+    /// it again afterwards unless the focused window is out of view.
+    private func syncFocusFromSystem(quiet: Bool = false) -> Bool {
         guard let app = NSWorkspace.shared.frontmostApplication, !isStalled(app.processIdentifier),
               let fw = AX.focusedWindow() else { return false }
         if let e = expectedFocus {
@@ -409,8 +432,17 @@ final class StripEngine {
         }
         guard let i = columns.firstIndex(where: { $0.win == fw }), i != focus else { return false }
         focus = i
+        if quiet && isMostlyVisible(i) { return false }
         scrollToFocus()
         return true
+    }
+
+    /// At least half of the column is inside the visible part of the strip (at scroll `s`).
+    private func isMostlyVisible(_ i: Int, at s: CGFloat? = nil) -> Bool {
+        let s = s ?? scroll
+        let x = stripX(i), w = colWidth(columns[i])
+        let shown = min(x + w, s + usableWidth) - max(x, s)
+        return shown >= w / 2
     }
 
     // MARK: Putting windows back
@@ -418,7 +450,8 @@ final class StripEngine {
     /// Moves every window the strip manages back on-screen. Called when tiling stops,
     /// on quit, and from the termination/crash handlers.
     func releaseWindows() {
-        anim?.invalidate()
+        anim.stop(); timeline = nil
+        writer.cancelAndWait()
         for c in columns where !isStalled(c.win.pid) {
             clampOnScreen(c.win)
             c.applied = nil
@@ -504,11 +537,15 @@ final class StripEngine {
         // During display sleep or reconfiguration the frame can be empty: write nothing.
         guard a.width >= 300, a.height >= 200 else { return }
         let all = NSScreen.screens.reduce(CGRect.null) { $0.union($1.frame) }
-        var x = a.minX + gap - scroll
+        let now = CACurrentMediaTime()
+        var stripPos = gap
         for c in columns {
             let w = colWidth(c)
-            var r = CGRect(x: x, y: a.minY + gap, width: w, height: a.height - 2 * gap)
-            x += w + gap
+            // Mid-animation, a slow app's window is sent where it should be when the move
+            // actually lands, so it keeps pace with the fast apps instead of trailing them.
+            let s = timeline.map { $0.scroll(at: now + 1.5 * writer.latency(c.win.pid)) } ?? scroll
+            var r = CGRect(x: a.minX + stripPos - s, y: a.minY + gap, width: w, height: a.height - 2 * gap)
+            stripPos += w + gap
             if r.maxX <= disp.minX { r.origin.x = all.minX - w - 100 }
             else if r.minX >= disp.maxX { r.origin.x = all.maxX + 100 }
             apply(AX.toAX(r).integral, to: c)
@@ -517,33 +554,57 @@ final class StripEngine {
     }
 
     /// Writes a frame only if it differs from the last one written, and only the position
-    /// when the size is unchanged (the common case while scrolling).
+    /// when the size is unchanged (the common case while scrolling). The write itself happens
+    /// off the main thread; `applied` is updated now and corrected if the write fails.
     private func apply(_ r: CGRect, to c: Column) {
         if c.applied == r || isStalled(c.win.pid) { return }
-        let err: AXError
-        if let last = c.applied, last.size == r.size { err = c.win.setPosition(r.origin) }
-        else { err = c.win.setFrame(r) }
+        let moveOnly = c.applied.map { $0.size == r.size } ?? false
+        c.applied = r
         c.wroteAt = Date()
-        if err == .cannotComplete { markStalled(c.win.pid) }
-        c.applied = err == .success ? r : nil
+        writer.write(c.win, r, moveOnly: moveOnly)
     }
 
-    /// Short eased scroll animation toward the target scroll value.
+    private func writeFinished(_ win: Win, _ r: CGRect, _ err: AXError) {
+        guard let c = columns.first(where: { $0.win == win }) else { return }
+        c.wroteAt = Date()   // the window's move notification echoes after this
+        if err == .cannotComplete { markStalled(win.pid) }
+        if err != .success, c.applied == r { c.applied = nil }
+    }
+
+    /// Eased scroll animation toward the target, stepped on every display refresh.
     private func animate(to target: CGFloat) {
-        anim?.invalidate()
-        let from = scroll, start = Date(), duration = 0.14
-        let t = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] timer in
-            MainActor.assumeIsolated {
-                guard let self else { timer.invalidate(); return }
-                let p = min(1, CGFloat(Date().timeIntervalSince(start) / duration))
-                let e = 1 - pow(1 - p, 3)
-                self.scroll = from + (target - from) * e
-                self.layout()
-                if p >= 1 { timer.invalidate() }
-            }
+        guard let scr = stripScreen, abs(target - scroll) > 0.5 else {
+            anim.stop(); timeline = nil; scroll = target; layout(); return
         }
-        RunLoop.main.add(t, forMode: .common)
-        anim = t
+        let from = scroll
+        var duration = min(0.32, 0.2 + Double(abs(target - from) / max(usableWidth, 1)) * 0.1)
+        // Give the slowest app on screen (before or after) about eight moves over the animation,
+        // up to 0.45 s, so its window glides rather than stepping.
+        let slowest = columns.indices.filter { isMostlyVisible($0, at: from) || isMostlyVisible($0, at: target) }
+            .map { writer.latency(columns[$0].win.pid) }.max() ?? 0
+        duration = max(duration, min(0.45, slowest * 8))
+        let tl = Timeline(from: from, to: target, start: CACurrentMediaTime(), duration: duration)
+        timeline = tl
+        anim.start(on: scr) { [weak self] in
+            guard let self else { return false }
+            let now = CACurrentMediaTime()
+            self.scroll = tl.scroll(at: now)
+            self.layout()
+            // Keep going until the most delayed (predicted) window has also reached the end.
+            let done = now >= tl.start + tl.duration
+            if done { self.timeline = nil; self.layout() }
+            return !done
+        }
+    }
+
+    /// An in-flight scroll animation, evaluable at any time (including slightly ahead).
+    private struct Timeline {
+        let from: CGFloat, to: CGFloat, start: CFTimeInterval, duration: CFTimeInterval
+        func scroll(at t: CFTimeInterval) -> CGFloat {
+            let p = min(1, max(0, (t - start) / duration))
+            let e = 1 - pow(1 - p, 4)   // quartic ease-out: fast start, soft landing
+            return from + (to - from) * CGFloat(e)
+        }
     }
 
     private func scrollToFocus() {
@@ -562,14 +623,25 @@ final class StripEngine {
         focus = i
         let w = columns[i].win
         expectedFocus = (w, Date().addingTimeInterval(0.6))
-        w.focus()
+        // Start moving first; focusing goes through the app's write queue so it can't stall the animation.
         scrollToFocus()
+        writer.run(on: w.pid) { w.focus() }
     }
 
+    func focus(column i: Int) { focusColumn(i) }
     func focusLeft() { guard focus > 0 else { return }; focusColumn(focus - 1) }
     func focusRight() { guard focus + 1 < columns.count else { return }; focusColumn(focus + 1) }
     func focusFirst() { focusColumn(0) }
     func focusLast() { focusColumn(columns.count - 1) }
+
+    /// Moves a column to a new slot (drag and drop on the strip map); focus stays on its window.
+    func moveColumn(from: Int, to: Int) {
+        guard columns.indices.contains(from), columns.indices.contains(to), from != to else { return }
+        let focused = columns.indices.contains(focus) ? columns[focus].win : nil
+        columns.insert(columns.remove(at: from), at: to)
+        if let focused, let i = columns.firstIndex(where: { $0.win == focused }) { focus = i }
+        scrollToFocus()
+    }
 
     func moveLeft() {
         guard focus > 0 else { return }
@@ -618,7 +690,7 @@ final class StripEngine {
     // MARK: Gesture scrolling (1:1 then snap)
 
     func scrollBy(_ dx: CGFloat) {
-        anim?.invalidate()
+        anim.stop(); timeline = nil
         scroll = clamped(scroll + dx)
         layout()
     }

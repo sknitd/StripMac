@@ -10,7 +10,7 @@ StripMac is a scrolling tiling window manager. Every window is a column on one e
 - Trackpad swipe moves the strip 1:1 and snaps to the nearest column → done (⌃⌥ + two-finger scroll, swallowed by an event tap; mouse wheel steps one column per notch)
 - Preset widths 25/33/50/66/75%, nudge, full width, centre → done
 - Centre modes: never, on overflow, always → done
-- Strip minimap that fades out → done
+- Strip minimap that fades out → done (app icon per column, focused/visible-area highlight, hover to hold, click to jump)
 - Smart floating of fixed-size windows; per-app float rules → done
 - Native fullscreen left alone → done
 - Launch at login → done (SMAppService)

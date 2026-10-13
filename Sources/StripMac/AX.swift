@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import QuartzCore
 
 /// Private but long-stable HIServices call mapping an AX window to its CGWindowID
 /// (used the same way by Rectangle, yabai and AeroSpace).
@@ -26,6 +27,16 @@ struct Win: Hashable {
     }
 
     var subrole: String { attr(kAXSubroleAttribute) ?? "" }
+    var title: String { attr(kAXTitleAttribute) ?? "" }
+
+    /// Closes just this window, as its red close button would (the app may ask to save).
+    @discardableResult
+    func close() -> Bool {
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(el, kAXCloseButtonAttribute as CFString, &v) == .success, let v,
+              CFGetTypeID(v) == AXUIElementGetTypeID() else { return false }
+        return AXUIElementPerformAction(unsafeBitCast(v, to: AXUIElement.self), kAXPressAction as CFString) == .success
+    }
     var isMinimized: Bool { (attr(kAXMinimizedAttribute) as Bool?) ?? false }
     var isFullscreen: Bool { (attr("AXFullScreen") as Bool?) ?? false }
 
@@ -112,6 +123,11 @@ enum AX {
     }
 
     /// The app's windows, or nil if the app did not answer in time.
+    /// How many ordinary document windows an app has open (any Space, minimised included).
+    static func standardWindowCount(pid: pid_t) -> Int {
+        (windows(of: AXUIElementCreateApplication(pid), pid: pid) ?? []).filter { $0.subrole == kAXStandardWindowSubrole as String }.count
+    }
+
     static func windows(of app: AXUIElement, pid: pid_t) -> [Win]? {
         var v: CFTypeRef?
         let err = AXUIElementCopyAttributeValue(app, kAXWindowsAttribute as CFString, &v)
@@ -190,5 +206,127 @@ final class AppWatcher {
         guard let observer else { return }
         CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
         self.observer = nil
+    }
+}
+
+// AXUIElement is a CFType and safe to message from any thread.
+extension Win: @unchecked Sendable {}
+
+/// Writes window frames off the main thread, on one serial queue per app, so a slow app never
+/// stalls the animation or the other apps. Writes are coalesced: while an app is busy, only the
+/// newest target per window is kept, so a lagging app skips frames instead of falling behind.
+final class AXWriter: @unchecked Sendable {
+    private struct Job { let rect: CGRect; let moveOnly: Bool }
+    private let lock = NSLock()
+    private var pending: [pid_t: [Win: Job]] = [:]
+    private var busy: Set<pid_t> = []
+    private var queues: [pid_t: DispatchQueue] = [:]
+    private var latencies: [pid_t: Double] = [:]   // smoothed seconds per window write
+    private let onResult: @Sendable (Win, CGRect, AXError) -> Void
+
+    init(onResult: @escaping @Sendable (Win, CGRect, AXError) -> Void) { self.onResult = onResult }
+
+    private func queue(_ pid: pid_t) -> DispatchQueue {   // call with lock held
+        if let q = queues[pid] { return q }
+        let q = DispatchQueue(label: "StripMac.ax.\(pid)", qos: .userInteractive)
+        queues[pid] = q
+        return q
+    }
+
+    func write(_ win: Win, _ rect: CGRect, moveOnly: Bool) {
+        lock.lock()
+        // A pending full write must stay a full write even if a later frame only moves.
+        let keepFull = pending[win.pid]?[win].map { !$0.moveOnly } ?? false
+        pending[win.pid, default: [:]][win] = Job(rect: rect, moveOnly: moveOnly && !keepFull)
+        let start = busy.insert(win.pid).inserted
+        let q = queue(win.pid)
+        lock.unlock()
+        if start { q.async { self.drain(win.pid) } }
+    }
+
+    /// Runs `body` on the app's queue, after any writes already queued for it.
+    func run(on pid: pid_t, _ body: @escaping @Sendable () -> Void) {
+        lock.lock(); let q = queue(pid); lock.unlock()
+        q.async(execute: body)
+    }
+
+    private func drain(_ pid: pid_t) {
+        while true {
+            lock.lock()
+            guard let jobs = pending.removeValue(forKey: pid), !jobs.isEmpty else {
+                busy.remove(pid); lock.unlock(); return
+            }
+            lock.unlock()
+            for (win, job) in jobs {
+                let t0 = CACurrentMediaTime()
+                let err = job.moveOnly ? win.setPosition(job.rect.origin) : win.setFrame(job.rect)
+                if job.moveOnly && err == .success {
+                    let dt = CACurrentMediaTime() - t0
+                    lock.lock()
+                    latencies[pid] = latencies[pid].map { $0 * 0.7 + dt * 0.3 } ?? dt
+                    lock.unlock()
+                }
+                onResult(win, job.rect, err)
+            }
+        }
+    }
+
+    /// How long a move of one of this app's windows typically takes to land (0 until measured).
+    func latency(_ pid: pid_t) -> Double {
+        lock.lock(); defer { lock.unlock() }
+        return latencies[pid] ?? 0
+    }
+
+    /// Drops queued writes and waits for in-flight ones, so callers can write final frames.
+    func cancelAndWait() {
+        lock.lock(); pending.removeAll(); let qs = Array(queues.values); lock.unlock()
+        for q in qs { q.sync {} }
+    }
+}
+
+/// Drives a callback on every refresh of a screen (macOS 14 `NSScreen.displayLink`).
+@MainActor
+final class FrameDriver: NSObject {
+    private var link: CADisplayLink?
+    private var tick: (@MainActor () -> Bool)?
+
+    /// `tick` returns false to stop.
+    func start(on screen: NSScreen, _ tick: @escaping @MainActor () -> Bool) {
+        stop()
+        self.tick = tick
+        let l = screen.displayLink(target: self, selector: #selector(step))
+        l.add(to: .main, forMode: .common)
+        link = l
+    }
+
+    func stop() { link?.invalidate(); link = nil; tick = nil }
+    var isRunning: Bool { link != nil }
+
+    @objc private func step(_ l: CADisplayLink) {
+        if tick?() != true { stop() }
+    }
+}
+
+enum Spaces {
+    /// Sends the system "Move left/right a space" shortcut (⌃← / ⌃→), the same switch a
+    /// trackpad swipe makes, so full-screen apps continue the strip on either side.
+    static func switchSpace(_ dir: Int) {
+        let key: CGKeyCode = dir > 0 ? 124 : 123
+        let src = CGEventSource(stateID: .hidSystemState)
+        for down in [true, false] {
+            guard let e = CGEvent(keyboardEventSource: src, virtualKey: key, keyDown: down) else { continue }
+            e.flags = [.maskControl, .maskSecondaryFn, .maskNumericPad]
+            e.post(tap: .cghidEventTap)
+        }
+    }
+
+    /// True when the frontmost window is a native full-screen window (its own Space).
+    @MainActor static var inFullScreenSpace: Bool {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return false }
+        let ax = AXUIElementCreateApplication(app.processIdentifier)
+        var v: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(ax, kAXFocusedWindowAttribute as CFString, &v) == .success,
+              let v, CFGetTypeID(v) == AXUIElementGetTypeID() else { return false }
+        return Win(el: unsafeBitCast(v, to: AXUIElement.self), pid: app.processIdentifier).isFullscreen
     }
 }

@@ -11,6 +11,7 @@ import Combine
 final class Gestures {
     private let engine: StripEngine
     private var tap: ScrollTap?
+    private var swipe: TrackpadSwipe?
     private var monitor: Any?
     private var snapWork: DispatchWorkItem?
     private var settingsSub: AnyCancellable?
@@ -24,10 +25,22 @@ final class Gestures {
         }
         tap = t
         syncEnabled()
-        settingsSub = Settings.shared.$gesturesEnabled.sink { [weak self] on in
+        settingsSub = Settings.shared.$gesturesEnabled
+            .combineLatest(Settings.shared.$trackpadSwipe, Settings.shared.$swipeFingers)
+            .sink { [weak self] on, swipe, fingers in
+                guard let self else { return }
+                self.tap?.enabled = on && self.engine.enabled
+                self.swipe?.enabled = swipe && self.engine.enabled
+                self.swipe?.fingers = fingers
+            }
+        let ff = TrackpadSwipe { [weak self] action in
             guard let self else { return }
-            self.tap?.enabled = on && self.engine.enabled
+            DispatchQueue.main.async { MainActor.assumeIsolated { self.performSwipe(action) } }
         }
+        swipe = ff
+        ff.enabled = Settings.shared.trackpadSwipe && engine.enabled
+        ff.fingers = Settings.shared.swipeFingers
+        if !ff.start() { NSLog("StripMac: no multitouch trackpad found; trackpad swipe unavailable") }
         if !t.start() {
             // No tap (should not happen with Accessibility granted): observe only, can't swallow.
             monitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { ev in
@@ -37,7 +50,23 @@ final class Gestures {
     }
 
     /// Call when tiling is turned on or off, so the tap stops swallowing ⌃⌥-scroll when unused.
-    func syncEnabled() { tap?.enabled = Settings.shared.gesturesEnabled && engine.enabled }
+    func syncEnabled() {
+        tap?.enabled = Settings.shared.gesturesEnabled && engine.enabled
+        swipe?.enabled = Settings.shared.trackpadSwipe && engine.enabled
+    }
+
+    /// One window per swipe. Past the ends of the strip, and inside a full-screen app's Space,
+    /// the swipe switches Spaces instead, so full-screen apps sit on either side of the strip.
+    private func performSwipe(_ action: TrackpadSwipe.Action) {
+        guard Settings.shared.trackpadSwipe, engine.enabled, !engine.accessLost else { return }
+        switch action {
+        case .swipe(let dir):
+            if Spaces.inFullScreenSpace { Spaces.switchSpace(dir); return }
+            let atEnd = dir > 0 ? engine.focus >= engine.columns.count - 1 : engine.focus <= 0
+            if atEnd { Spaces.switchSpace(dir) }
+            else if dir > 0 { engine.focusRight() } else { engine.focusLeft() }
+        }
+    }
 
     private func perform(_ action: ScrollTap.Action) {
         guard Settings.shared.gesturesEnabled, engine.enabled, !engine.accessLost else { return }

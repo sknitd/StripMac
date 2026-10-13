@@ -5,8 +5,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 BINS=()
 for arch in arm64 x86_64; do
-  swift build -c release --arch "$arch"
-  BINS+=("$(swift build -c release --arch "$arch" --show-bin-path)/StripMac")
+  # Separate scratch paths: two arches sharing one build database corrupts it on rebuilds.
+  swift build -c release --arch "$arch" --scratch-path ".build/$arch"
+  BINS+=("$(swift build -c release --arch "$arch" --scratch-path ".build/$arch" --show-bin-path)/StripMac")
 done
 APP=build/StripMac.app
 rm -rf build && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"

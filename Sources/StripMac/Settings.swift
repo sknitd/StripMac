@@ -22,6 +22,8 @@ final class Settings: ObservableObject {
     @Published var presetsText: String { didSet { d.set(presetsText, forKey: "presets"); changed() } }
     @Published var centerMode: CenterMode { didSet { d.set(centerMode.rawValue, forKey: "centerMode"); changed() } }
     @Published var gesturesEnabled: Bool { didSet { d.set(gesturesEnabled, forKey: "gestures") } }
+    @Published var trackpadSwipe: Bool { didSet { d.set(trackpadSwipe, forKey: "trackpadSwipe") } }
+    @Published var swipeFingers: Int { didSet { d.set(swipeFingers, forKey: "swipeFingers") } }
     @Published var showMinimap: Bool { didSet { d.set(showMinimap, forKey: "minimap") } }
     @Published var excludedBundleIDs: String { didSet { d.set(excludedBundleIDs, forKey: "excluded"); changed() } }
     /// CGDirectDisplayID of the strip's display; 0 = the primary display.
@@ -35,6 +37,8 @@ final class Settings: ObservableObject {
         presetsText = d.string(forKey: "presets") ?? "0.33, 0.5, 0.66, 0.75, 1.0"
         centerMode = CenterMode(rawValue: d.string(forKey: "centerMode") ?? "") ?? .onOverflow
         gesturesEnabled = d.object(forKey: "gestures") as? Bool ?? true
+        trackpadSwipe = d.object(forKey: "trackpadSwipe") as? Bool ?? true
+        swipeFingers = d.object(forKey: "swipeFingers") as? Int ?? 3
         showMinimap = d.object(forKey: "minimap") as? Bool ?? true
         excludedBundleIDs = d.string(forKey: "excluded") ?? "com.apple.calculator, com.apple.systempreferences"
         stripDisplayID = d.integer(forKey: "stripDisplay")

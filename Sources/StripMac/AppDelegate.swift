@@ -226,6 +226,19 @@ struct SettingsView: View {
     @ObservedObject var hotkeys: Hotkeys
     let bindings: [String]
     @State private var loginStatus = SMAppService.mainApp.status
+    @State private var previewAllowed = WindowPreview.canCapture
+
+    /// Why macOS would also react to a swipe with this many fingers, or nil if nothing clashes.
+    static func systemClash(fingers: Int) -> String? {
+        let tp = UserDefaults(suiteName: "com.apple.AppleMultitouchTrackpad")
+        if fingers == 3, tp?.integer(forKey: "TrackpadThreeFingerDrag") == 1 {
+            return "Three-finger drag is on, so three-finger swipes drag instead. Pick four fingers, or turn off three-finger drag."
+        }
+        let key = fingers == 3 ? "TrackpadThreeFingerHorizSwipeGesture" : "TrackpadFourFingerHorizSwipeGesture"
+        guard tp?.integer(forKey: key) == 2 else { return nil }   // 2 = switches Spaces
+        let other = fingers == 3 ? "four" : "three"
+        return "macOS also switches Spaces with \(fingers == 3 ? "three" : "four") fingers, so both will react. Set Trackpad → More Gestures → \"Swipe between full-screen applications\" to \(other) fingers, or pick the other count here."
+    }
     @State private var loginError: String?
 
     /// Reflects the real service status; the setter calls the service once and re-reads the
@@ -258,8 +271,44 @@ struct SettingsView: View {
                 Picker("Centre focused column", selection: $s.centerMode) {
                     ForEach(CenterMode.allCases) { Text($0.label).tag($0) }
                 }
-                Toggle("Trackpad swipe navigation (⌃⌥ + scroll)", isOn: $s.gesturesEnabled)
-                Toggle("Show strip minimap while navigating", isOn: $s.showMinimap)
+                Toggle(isOn: $s.gesturesEnabled) {
+                    Text("Scroll navigation (hold ⌃⌥ + scroll)")
+                    Text("Trackpad or Magic Mouse: the strip follows your fingers and snaps to a column. Mouse wheel: one column per notch.")
+                }
+                Toggle(isOn: $s.trackpadSwipe) {
+                    Text("Trackpad swipe")
+                    Text("Swipe left or right to move one window. Past either end it switches to your full-screen apps, like the native swipe between Spaces.")
+                }
+                Picker("Fingers", selection: $s.swipeFingers) {
+                    Text("Three").tag(3)
+                    Text("Four").tag(4)
+                }
+                .pickerStyle(.segmented)
+                .disabled(!s.trackpadSwipe)
+                if s.trackpadSwipe, let clash = Self.systemClash(fingers: s.swipeFingers) {
+                    HStack {
+                        Text(clash).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                        Button("Open Trackpad Settings") {
+                            if let u = URL(string: "x-apple.systempreferences:com.apple.Trackpad-Settings.extension") { NSWorkspace.shared.open(u) }
+                        }
+                    }
+                }
+                Toggle(isOn: $s.showMinimap) {
+                    Text("Show strip map while navigating")
+                    Text("Hover to keep it open, click a window to jump to it, hover 2 s for a preview, press and hold 3 s to reorder. Each window shows its app's RAM use; × quits the app.")
+                }
+                if !previewAllowed {
+                    HStack {
+                        Text("Live window previews need Screen Recording permission.").foregroundStyle(.secondary)
+                        Button("Allow…") {
+                            if !CGRequestScreenCaptureAccess(),
+                               let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+                                NSWorkspace.shared.open(u)
+                            }
+                            previewAllowed = WindowPreview.canCapture
+                        }
+                    }
+                }
                 Toggle("Launch at login", isOn: launchAtLogin)
                 if loginStatus == .requiresApproval {
                     HStack {
